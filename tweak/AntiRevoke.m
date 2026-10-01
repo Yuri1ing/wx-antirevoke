@@ -606,6 +606,36 @@ static NSString *WXARBuildDiagReport(NSString *bid) {
     return s;
 }
 
+/// 判定当前是不是微信进程。
+///
+/// 早先这里硬编码比对 bundle id == "com.tencent.xin"，结果**改过包名的多开版
+/// 微信一进来就被拒了**（真实案例）。改成「能不能找到微信独有的类」来判定：
+/// 改包名、改签名都不影响，同时也不会误判到别的 App 上（这些类只有微信有）。
+static BOOL WXARIsWeChatProcess(void) {
+    static const char *kProbeClasses[] = {
+        "MessageRevokeMgr",         // 撤回管理器，8.0.75 实测存在
+        "MessageBatchRevokeMgr",
+        "CMessageMgr",
+        "MessageService",
+        "MMServiceCenter",
+        "CContactMgr",
+        "MMMsgLogic",
+    };
+    for (size_t i = 0; i < sizeof(kProbeClasses) / sizeof(kProbeClasses[0]); i++) {
+        if (objc_getClass(kProbeClasses[i])) return YES;
+    }
+
+    // 兜底：包名里带这些关键词也认
+    NSString *bid = [[NSBundle mainBundle].bundleIdentifier lowercaseString];
+    if (bid) {
+        if ([bid containsString:@"tencent"] || [bid containsString:@"wechat"] ||
+            [bid containsString:@"weixin"]  || [bid containsString:@"xin"]) {
+            return YES;
+        }
+    }
+    return NO;
+}
+
 static void WXAREntry(void) {
     @autoreleasepool {
         WXARLogInit();
@@ -613,16 +643,17 @@ static void WXAREntry(void) {
 
         NSString *bid = [NSBundle mainBundle].bundleIdentifier;
 
-        // 包名不对时也弹窗：这样能立刻发现「多开改过包名」这种情况
-        if (!bid || ![bid isEqualToString:@WXAR_TARGET_BID]) {
-            NSLog(@"[anti-revoke] 非微信进程 (%@)，不启用", bid);
+        if (!WXARIsWeChatProcess()) {
+            NSLog(@"[anti-revoke] 不是微信进程 (%@)，不启用", bid);
             WXARPopupWhenReady(@"⚠️ 防撤回未启用",
                 [NSString stringWithFormat:
-                    @"当前进程的 Bundle ID 不是微信：\n\n%@\n\n期望值：%s\n\n"
-                    @"如果是改过包名的多开微信，需要改代码里的 WXAR_TARGET_BID 再重新编译。",
-                    bid ? bid : @"(nil)", WXAR_TARGET_BID], 8);
+                    @"没能在当前进程里找到任何微信独有的类，判定这里不是微信。\n\n"
+                    @"Bundle ID：%@\n\n"
+                    @"如果这确实是微信，请把这个弹窗内容发给我。",
+                    bid ? bid : @"(nil)"], 8);
             return;
         }
+        WXARLog(@"确认是微信进程（Bundle ID = %@）", bid);
 
         WXARLog(@"======== 微信防撤回 v%s 已加载 ========", WXAR_VERSION);
         WXARLog(@"设备 %@ / iOS %@",
