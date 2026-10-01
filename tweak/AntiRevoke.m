@@ -233,6 +233,98 @@ static Method WXAROwnMethod(Class cls, SEL sel) {
 //
 // 全程 @try 保护 + respondsToSelector 校验：任何一环拿不到就安静放弃，
 // 退化成「无提示的防撤回」，绝不让微信崩。
+//
+// 【关于怎么拿到 CMessageMgr 实例】
+// 实测（用户真机反馈）8.0.75 上：
+//   - MMServiceCenter 没有任何类方法        → 无法 getService:
+//   - CMessageMgr 的类方法只有 9 个工具方法 → 没有单例入口
+//   - MessageRevokeMgr 实例的 ivar 里也没有 CMessageMgr
+// 所以「主动获取」这条路是死的。改成**反向捕获**：hook CMessageMgr 自己的方法，
+// 等微信正常调用它时，把 self 记下来。
+
+static id gCachedMessageMgr = nil;
+
+static void WXARCacheMessageMgr(id mgr) {
+    if (!mgr || gCachedMessageMgr) return;
+    gCachedMessageMgr = mgr;
+    WXARLog(@"✅ 已捕获 CMessageMgr 实例：%s", object_getClassName(mgr));
+}
+
+/// 转发桩（1 个对象参数、void 返回）：先记下 self，再照常执行原实现
+static void wxar_cachemgr_void1(id self, SEL _cmd, id a1) {
+    WXARCacheMessageMgr(self);
+    IMP orig = WXARObserveOriginal(_cmd);
+    if (orig) {
+        ((void (*)(id, SEL, id))orig)(self, _cmd, a1);
+    }
+}
+
+/// 转发桩（无参数、返回对象）：用于 -init 这类，创建瞬间就捕获
+static id wxar_cachemgr_obj0(id self, SEL _cmd) {
+    IMP orig = WXARObserveOriginal(_cmd);
+    id ret = orig ? ((id (*)(id, SEL))orig)(self, _cmd) : nil;
+    WXARCacheMessageMgr(ret ? ret : self);
+    return ret;
+}
+
+/// 装一个捕获钩子。takesArg=YES 对应「1 个对象参数 + void 返回」，
+/// NO 对应「无参数 + 返回对象」。
+static BOOL WXARInstallCatcher(Class cls, const char *selName, BOOL takesArg) {
+    if (!cls) return NO;
+    if (gHookCount >= (int)(sizeof(gHooks) / sizeof(gHooks[0]))) return NO;
+
+    SEL sel = NSSelectorFromString([NSString stringWithUTF8String:selName]);
+    for (int i = 0; i < gHookCount; i++) {
+        if (gHooks[i].sel == sel) return NO;      // 已处理过
+    }
+    Method m = WXAROwnMethod(cls, sel);
+    if (!m) return NO;
+
+    const char *types = method_getTypeEncoding(m);
+    IMP newImp = NULL;
+    if (takesArg) {
+        if (!WXARIsVoidOneObjectArg(types)) return NO;
+        newImp = (IMP)wxar_cachemgr_void1;
+    } else {
+        if (!types || strcmp(types, "@16@0:8") != 0) return NO;
+        newImp = (IMP)wxar_cachemgr_obj0;
+    }
+
+    IMP original = method_setImplementation(m, newImp);
+    if (!original) return NO;
+
+    WXARHookRecord *rec = &gHooks[gHookCount++];
+    rec->cls = cls;
+    rec->sel = sel;
+    rec->original = original;
+    WXARLog(@"装好捕获钩子：CMessageMgr -%s", selName);
+    return YES;
+}
+
+/// 尽量在 CMessageMgr 被创建/使用之前把这些钩子装上
+static int WXARInstallMgrCatcher(void) {
+    Class cls = objc_getClass("CMessageMgr");
+    if (!cls) return 0;
+    int n = 0;
+
+    // 「1 个对象参数 + void」的高频方法，微信跑起来就会调到
+    static const char *kCatchSels[] = {
+        "InitMsgMgr:",
+        "AsyncOnUnReadChange:",
+        "reloadRevokeMsgNode:",
+        "AddMsgPattern:",
+        "checkForSecSystemMsg:",
+        "onSecMsg:",
+        "UpdateVideoStatus:",
+    };
+    for (size_t i = 0; i < sizeof(kCatchSels) / sizeof(kCatchSels[0]); i++) {
+        if (WXARInstallCatcher(cls, kCatchSels[i], YES)) n++;
+    }
+    if (WXARInstallCatcher(cls, "init", NO)) n++;
+
+    WXARLog(@"CMessageMgr 捕获钩子装了 %d 个", n);
+    return n;
+}
 
 /// 无视诊断开关，强制弹窗。只给「撤回提示」这一个功能排错时用。
 static void WXARPopupForce(NSString *title, NSString *message) {
@@ -371,6 +463,9 @@ static id WXARFindMgrInIvars(id obj, NSMutableString *diag) {
 /// 拿 CMessageMgr 单例。
 /// hint 是调用方的实例（MessageRevokeMgr 之类），用于最后一招：翻它的 ivar。
 static id WXARMessageMgrFrom(id hint) {
+    // 反向捕获到的实例优先（这是正常路径）
+    if (gCachedMessageMgr) return gCachedMessageMgr;
+
     static id cached = nil;
     static BOOL tried = NO;
     if (tried) return cached;
@@ -999,6 +1094,9 @@ static void WXAREntry(void) {
             return;
         }
         WXARLog(@"确认是微信进程（Bundle ID = %@）", bid);
+
+        // 尽早装「捕获 CMessageMgr」的钩子：必须在它被创建/使用之前装上
+        WXARInstallMgrCatcher();
 
         WXARLog(@"======== 微信防撤回 v%s 已加载 ========", WXAR_VERSION);
         WXARLog(@"设备 %@ / iOS %@",
