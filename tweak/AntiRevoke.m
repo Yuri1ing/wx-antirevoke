@@ -355,6 +355,19 @@ static void WXARPopupForce(NSString *title, NSString *message) {
     });
 }
 
+/// 剥掉 <![CDATA[ ... ]]> 包装。
+/// 微信的 <replacemsg> 内容本身就带 CDATA 壳，
+/// 直接显示会变成 <![CDATA["某某" 撤回了一条消息]]>，很难看。
+static NSString *WXARStripCDATA(NSString *s) {
+    if (s.length == 0) return s;
+    NSString *t = [s stringByTrimmingCharactersInSet:
+                      [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if ([t hasPrefix:@"<![CDATA["] && [t hasSuffix:@"]]>"] && t.length > 12) {
+        return [t substringWithRange:NSMakeRange(8, t.length - 8 - 3)];
+    }
+    return t;
+}
+
 /// 取 <tag>...</tag> 之间的内容
 static NSString *WXARTagValue(NSString *xml, NSString *tag) {
     if (!xml || !tag) return nil;
@@ -618,8 +631,14 @@ static void WXARTryInsertRevokeTip(id owner, id arg) {
         }
 
         // 提示文案优先用微信自己生成的 <replacemsg>：
-        // 它在私聊里是「对方」，在群聊里会带上具体昵称，比我们自己拼「对方」准确得多。
+        // 它在私聊里是「对方」，在群聊里会带上具体昵称。
+        // 注意：它的内容是**带 CDATA 壳**的（<![CDATA["某某" 撤回了一条消息]]>），
+        // 所以要把壳剥掉，否则聊天框里会显示一串尖括号。
         NSString *tipText = WXARTagValue(content, @"replacemsg");
+        if ([tipText hasPrefix:@"<![CDATA["] && [tipText hasSuffix:@"]]>"]
+            && tipText.length > 12) {
+            tipText = [tipText substringWithRange:NSMakeRange(9, tipText.length - 12)];
+        }
         if (tipText.length == 0) {
             // 退一步：从 CDATA 里抠出「XXX撤回了一条消息」
             NSString *src = content ? content : @"";
