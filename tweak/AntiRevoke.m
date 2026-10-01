@@ -39,9 +39,11 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+#import <dispatch/dispatch.h>
 #import <ctype.h>
 #import <string.h>
 #import <stdlib.h>
+#import <stdarg.h>
 
 // ===========================================================================
 #pragma mark - 版本与开关
@@ -282,6 +284,8 @@ static WXARCandidate kCandidates[] = {
     {"MessageBatchRevokeMgr",           "onRevokeMsg:"},
 
     // ===== 8.0.75 实测存在：真正执行替换的动作（冗余兜底）=====
+    // 副作用提示：这两条如果生效，你自己主动撤回消息时，本地也会保留原文
+    //（相当于「自己也防撤回」）。如果不想要这个效果，把下面两行注释掉再重新编译即可。
     {"MessageRevokeMgr",                "replaceRevokedMsg:"},
     {"MessageRevokeMgr",                "batchReplaceRevokedMsg:"},
 
