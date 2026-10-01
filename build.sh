@@ -47,8 +47,9 @@ SLICES=()
 for ARCH in $ARCHS; do
   echo "==> 编译 $ARCH"
   OUT_SLICE="$OUT_DIR/${NAME}-${ARCH}.dylib"
+  # 显式给出 target 三元组：只给 -arch 时，clang 有时会推断成 macOS 目标
   xcrun -sdk iphoneos clang \
-    -arch "$ARCH" \
+    -target "${ARCH}-apple-ios${MIN_IOS}" \
     "${COMMON_FLAGS[@]}" \
     -dynamiclib \
     -install_name "@executable_path/${NAME}.dylib" \
