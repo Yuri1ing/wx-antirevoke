@@ -39,9 +39,11 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+#import <dispatch/dispatch.h>
 #import <ctype.h>
 #import <string.h>
 #import <stdlib.h>
+#import <stdarg.h>
 
 // ===========================================================================
 #pragma mark - 版本与开关
@@ -54,7 +56,7 @@
 
 // 延迟重试的轮次（秒）。微信的类大多在启动阶段就注册好了，
 // 留几轮是为了兜底那些懒加载的控制器。
-static const double kRetryDelays[] = {0.0, 1.0, 3.0, 6.0, 12.0, 20.0};
+static const double kRetryDelays[] = {0.0, 1.0, 3.0, 6.0, 10.0};
 
 // ===========================================================================
 #pragma mark - 日志
@@ -118,8 +120,75 @@ typedef struct {
     IMP    original;
 } WXARHookRecord;
 
-static WXARHookRecord gHooks[32];
+static WXARHookRecord gHooks[512];
 static int            gHookCount = 0;
+
+// ===========================================================================
+#pragma mark - 诊断上报（弹窗版）
+//
+// 非越狱设备上，沙盒里的日志文件很难取出来看。所以诊断版直接把结果弹到屏幕上：
+//   1. 启动若干秒后弹一次，列出「哪些入口 hook 成功 / 哪些没命中 / 为什么」
+//   2. 每次真的拦到撤回时再弹一次，证明方法确实被调用了
+// 这样一眼就能区分「dylib 没加载」和「加载了但入口不对」。
+
+static NSMutableArray<NSString *> *gDiagHooked  = nil;   // hook 成功
+static NSMutableArray<NSString *> *gDiagMissed  = nil;   // 未命中
+static NSMutableArray<NSString *> *gDiagRefused = nil;   // 被规则拒绝
+static int gDiagHitPopupCount = 0;
+
+static void WXARDiagInit(void) {
+    if (gDiagHooked) return;
+    gDiagHooked  = [NSMutableArray array];
+    gDiagMissed  = [NSMutableArray array];
+    gDiagRefused = [NSMutableArray array];
+}
+
+static UIViewController *WXARTopViewController(void) {
+    UIWindow *keyWindow = nil;
+    NSArray<UIWindow *> *windows = [UIApplication sharedApplication].windows;
+    for (UIWindow *w in windows) {
+        if (w.isKeyWindow) { keyWindow = w; break; }
+    }
+    if (!keyWindow) keyWindow = windows.firstObject;
+    UIViewController *vc = keyWindow.rootViewController;
+    if (!vc) return nil;
+    while (vc.presentedViewController) vc = vc.presentedViewController;
+    return vc;
+}
+
+/// 弹一个提示。可能被微信的 UI 挡住或者当时还没有窗口，所以失败就静默放弃。
+static void WXARPopup(NSString *title, NSString *message) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @try {
+            UIViewController *top = WXARTopViewController();
+            if (!top) return;
+            UIAlertController *ac =
+                [UIAlertController alertControllerWithTitle:title
+                                                    message:message
+                                             preferredStyle:UIAlertControllerStyleAlert];
+            [ac addAction:[UIAlertAction actionWithTitle:@"知道了"
+                                                   style:UIAlertActionStyleDefault
+                                                 handler:nil]];
+            [top presentViewController:ac animated:YES completion:nil];
+        } @catch (NSException *e) {
+            // 弹不出来绝不能影响微信本身
+        }
+    });
+}
+
+/// 反复尝试弹窗，直到拿到可用的 view controller（最多 12 次，每次隔 1 秒）
+static void WXARPopupWhenReady(NSString *title, NSString *message, int attemptsLeft) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        @autoreleasepool {
+            if (WXARTopViewController() || attemptsLeft <= 0) {
+                WXARPopup(title, message);
+            } else {
+                WXARPopupWhenReady(title, message, attemptsLeft - 1);
+            }
+        }
+    });
+}
 
 /// 判断某个方法是不是「由这个类自己定义」的（而不是从父类继承的）。
 /// 这样 method_setImplementation 只会影响目标类。
@@ -146,8 +215,18 @@ static void WXARNoteHit(id self, SEL _cmd, id arg) {
         // 用 C 函数取类名，比发消息更轻、更不容易出意外
         argCls = object_getClassName(arg);
     }
-    WXARLog(@"🛡 已拦截撤回  %@ -%@   参数类型=%s",
-            NSStringFromClass([self class]), NSStringFromSelector(_cmd), argCls);
+    NSString *desc = [NSString stringWithFormat:@"%@ -%@\n参数类型: %s",
+                      NSStringFromClass([self class]),
+                      NSStringFromSelector(_cmd), argCls];
+    WXARLog(@"🛡 已拦截撤回  %@", desc);
+
+    // 诊断版：真的拦到撤回时弹窗报喜，最多弹 5 次免得刷屏
+    if (gDiagHitPopupCount < 5) {
+        gDiagHitPopupCount++;
+        WXARPopup(@"✅ 防撤回已生效",
+                  [NSString stringWithFormat:@"拦截到撤回入口：\n\n%@\n\n(第 %d 次)",
+                   desc, gDiagHitPopupCount]);
+    }
 }
 
 static void  wxar_stub_void(id self, SEL _cmd, id a1) { WXARNoteHit(self, _cmd, a1); }
@@ -202,26 +281,44 @@ static BOOL WXARContainsRevokeWord(const char *s) {
 
 /// 安全的实例方法替换。返回 YES 表示替换成功。
 static BOOL WXARSwizzle(NSString *clsName, NSString *selName) {
+    WXARDiagInit();
+
+    // 注意：安装会分多轮重试，所以诊断记录必须去重，否则报告里全是重复项
     Class cls = objc_getClass(clsName.UTF8String);
-    if (!cls) return NO;                       // 类不存在是常态（跨版本），不刷屏
+    if (!cls) {
+        NSString *line = [NSString stringWithFormat:@"%@ -%@ (类未注册)",
+                          clsName, selName];
+        if (![gDiagMissed containsObject:line]) [gDiagMissed addObject:line];
+        return NO;
+    }
 
     SEL sel = NSSelectorFromString(selName);
     Method m = WXAROwnMethod(cls, sel);
-    if (!m) return NO;
+    if (!m) {
+        NSString *line = [NSString stringWithFormat:@"%@ -%@ (该类未定义)",
+                          clsName, selName];
+        if (![gDiagMissed containsObject:line]) [gDiagMissed addObject:line];
+        return NO;
+    }
 
     // 双保险：方法名里必须真的含 revoke / recall
     const char *selCStr = sel_getName(sel);
     if (!WXARContainsRevokeWord(selCStr)) {
+        NSString *line = [NSString stringWithFormat:@"%@ -%@ (名字不含 revoke)",
+                          clsName, selName];
+        if (![gDiagRefused containsObject:line]) [gDiagRefused addObject:line];
         WXARLog(@"拒绝 hook %@ -%@：方法名不含 revoke/recall", clsName, selName);
         return NO;
     }
 
-    // 已经 hook 过就不重复
+    // 已经 hook 过就不重复（也不重复记诊断）
     for (int i = 0; i < gHookCount; i++) {
         if (gHooks[i].cls == cls && gHooks[i].sel == sel) return YES;
     }
     if (gHookCount >= (int)(sizeof(gHooks) / sizeof(gHooks[0]))) {
-        WXARLog(@"hook 表已满，跳过 %@ -%@", clsName, selName);
+        NSString *line = [NSString stringWithFormat:@"%@ -%@ (替换表已满)",
+                          clsName, selName];
+        if (![gDiagMissed containsObject:line]) [gDiagMissed addObject:line];
         return NO;
     }
 
@@ -229,6 +326,9 @@ static BOOL WXARSwizzle(NSString *clsName, NSString *selName) {
     WXARStub stub = WXARStubForEncoding(types);
     IMP newImp = WXARImpForStub(stub);
     if (!newImp) {
+        NSString *line = [NSString stringWithFormat:@"%@ -%@ (返回类型 %s 不支持)",
+                          clsName, selName, types ? types : "?"];
+        if (![gDiagRefused containsObject:line]) [gDiagRefused addObject:line];
         WXARLog(@"放弃 %@ -%@：返回类型无法识别 [%s]", clsName, selName,
                 types ? types : "?");
         return NO;
@@ -236,7 +336,9 @@ static BOOL WXARSwizzle(NSString *clsName, NSString *selName) {
 
     IMP original = method_setImplementation(m, newImp);
     if (!original) {
-        WXARLog(@"替换失败 %@ -%@", clsName, selName);
+        NSString *line = [NSString stringWithFormat:@"%@ -%@ (替换失败)",
+                          clsName, selName];
+        if (![gDiagMissed containsObject:line]) [gDiagMissed addObject:line];
         return NO;
     }
 
@@ -245,8 +347,137 @@ static BOOL WXARSwizzle(NSString *clsName, NSString *selName) {
     rec->sel = sel;
     rec->original = original;
 
+    [gDiagHooked addObject:[NSString stringWithFormat:@"%@ -%@  [%s]",
+                            clsName, selName, types ? types : "?"]];
     WXARLog(@"✅ 已拦截 %@ -%@   [%s]", clsName, selName, types ? types : "?");
     return YES;
+}
+
+// ===========================================================================
+#pragma mark - 观察模式（只记录，绝不改变行为）
+//
+// 目的：万一候选表猜错了入口，还能知道「撤回时到底走了哪些方法」。
+// 安全性：只包装「void 返回 + 恰好一个对象参数」的方法，桩函数原样调用原实现，
+//        参数传递完全一致，所以行为与不包装时相同。
+//        同一个 SEL 只包装一次，避免按 SEL 取原实现时取错。
+
+typedef void (*WXARObsFn)(id, SEL, id);
+
+static NSMutableArray<NSString *> *gObserved = nil;
+static BOOL gObservePopupScheduled = NO;
+
+/// 严格匹配形如 v24@0:8@16 的签名：void 返回 + 恰好一个对象参数。
+/// 只有这种签名才能用一参数桩安全地转发，多一个参数就会串寄存器。
+static BOOL WXARIsVoidOneObjectArg(const char *types) {
+    if (!types) return NO;
+    const char *p = types;
+    if (*p != 'v') return NO;
+    p++;
+    while (*p >= '0' && *p <= '9') p++;
+    if (*p != '@') return NO;
+    p++;
+    while (*p >= '0' && *p <= '9') p++;
+    if (*p != ':') return NO;
+    p++;
+    while (*p >= '0' && *p <= '9') p++;
+    if (*p != '@') return NO;
+    p++;
+    while (*p >= '0' && *p <= '9') p++;
+    return (*p == '\0');
+}
+
+static IMP WXARObserveOriginal(SEL sel) {
+    for (int i = 0; i < gHookCount; i++) {
+        if (gHooks[i].sel == sel) return gHooks[i].original;
+    }
+    return NULL;
+}
+
+/// 收集观察结果，攒 2 秒一次性弹出，避免被刷屏
+static void WXARRecordObservation(NSString *line) {
+    if (!gObserved) gObserved = [NSMutableArray array];
+    @synchronized (gObserved) {
+        if (gObserved.count > 200) return;
+        [gObserved addObject:line];
+    }
+    WXARLog(@"👀 %@", line);
+
+    if (gObservePopupScheduled) return;
+    gObservePopupScheduled = YES;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        gObservePopupScheduled = NO;
+        NSArray *snapshot = nil;
+        @synchronized (gObserved) {
+            snapshot = [gObserved copy];
+            [gObserved removeAllObjects];
+        }
+        if (snapshot.count == 0) return;
+        NSMutableString *m = [NSMutableString stringWithString:@"撤回时这些方法被调用了：\n\n"];
+        NSUInteger n = snapshot.count > 25 ? 25 : snapshot.count;
+        for (NSUInteger i = 0; i < n; i++) {
+            [m appendFormat:@"%@\n", snapshot[i]];
+        }
+        WXARPopup(@"👀 观察到撤回动作", m);
+    });
+}
+
+static void wxar_observe_void1(id self, SEL _cmd, id a1) {
+    WXARRecordObservation([NSString stringWithFormat:@"%@ -%@",
+        NSStringFromClass([self class]), NSStringFromSelector(_cmd)]);
+    IMP orig = WXARObserveOriginal(_cmd);
+    if (orig) {
+        ((WXARObsFn)orig)(self, _cmd, a1);   // 照常执行，行为不变
+    }
+}
+
+static BOOL WXARSwizzleObserve(Class cls, SEL sel) {
+    if (gHookCount >= (int)(sizeof(gHooks) / sizeof(gHooks[0]))) return NO;
+    for (int i = 0; i < gHookCount; i++) {
+        if (gHooks[i].sel == sel) return NO;   // 同 SEL 已处理，不重复包装
+    }
+    Method m = WXAROwnMethod(cls, sel);
+    if (!m) return NO;
+    IMP original = method_setImplementation(m, (IMP)wxar_observe_void1);
+    if (!original) return NO;
+
+    WXARHookRecord *rec = &gHooks[gHookCount++];
+    rec->cls = cls;
+    rec->sel = sel;
+    rec->original = original;
+    return YES;
+}
+
+static int WXARInstallObservers(void) {
+    int installed = 0;
+    int count = objc_getClassList(NULL, 0);
+    if (count <= 0) return 0;
+    if (count > 200000) count = 200000;
+    Class *classes = (Class *)malloc(sizeof(Class) * (size_t)count);
+    if (!classes) return 0;
+    count = objc_getClassList(classes, count);
+
+    for (int i = 0; i < count; i++) {
+        Class cls = classes[i];
+        const char *cname = class_getName(cls);
+        if (!cname || !WXARContainsRevokeWord(cname)) continue;
+
+        unsigned int mcount = 0;
+        Method *methods = class_copyMethodList(cls, &mcount);
+        if (!methods) continue;
+        for (unsigned int j = 0; j < mcount; j++) {
+            SEL sel = method_getName(methods[j]);
+            const char *sname = sel_getName(sel);
+            if (!sname || !WXARContainsRevokeWord(sname)) continue;
+            if (!WXARIsVoidOneObjectArg(method_getTypeEncoding(methods[j]))) continue;
+            if (installed >= 400) continue;          // 上限保护，别把表塞满
+            if (WXARSwizzleObserve(cls, sel)) installed++;
+        }
+        free(methods);
+    }
+    free(classes);
+    WXARLog(@"观察模式：包装了 %d 个方法", installed);
+    return installed;
 }
 
 // ===========================================================================
@@ -282,6 +513,8 @@ static WXARCandidate kCandidates[] = {
     {"MessageBatchRevokeMgr",           "onRevokeMsg:"},
 
     // ===== 8.0.75 实测存在：真正执行替换的动作（冗余兜底）=====
+    // 副作用提示：这两条如果生效，你自己主动撤回消息时，本地也会保留原文
+    //（相当于「自己也防撤回」）。如果不想要这个效果，把下面两行注释掉再重新编译即可。
     {"MessageRevokeMgr",                "replaceRevokedMsg:"},
     {"MessageRevokeMgr",                "batchReplaceRevokedMsg:"},
 
@@ -351,13 +584,43 @@ static void WXARInstallHooks(void) {
     WXARLog(@"本轮命中 %d/%d 个入口", ok, total);
 }
 
+static NSString *WXARBuildDiagReport(NSString *bid) {
+    NSMutableString *s = [NSMutableString string];
+    [s appendFormat:@"版本 %s\n", WXAR_VERSION];
+    [s appendFormat:@"Bundle ID:\n%@\n", bid ? bid : @"(nil)"];
+    [s appendFormat:@"%@ / iOS %@\n\n",
+        [[UIDevice currentDevice] model], [[UIDevice currentDevice] systemVersion]];
+
+    [s appendFormat:@"✅ 已 Hook (%lu)\n", (unsigned long)gDiagHooked.count];
+    if (gDiagHooked.count == 0) [s appendString:@"   一个都没有\n"];
+    for (NSString *x in gDiagHooked) [s appendFormat:@"   %@\n", x];
+
+    if (gDiagMissed.count) {
+        [s appendFormat:@"\n✗ 未命中 (%lu)\n", (unsigned long)gDiagMissed.count];
+        for (NSString *x in gDiagMissed) [s appendFormat:@"   %@\n", x];
+    }
+    if (gDiagRefused.count) {
+        [s appendFormat:@"\n⛔ 被拒绝 (%lu)\n", (unsigned long)gDiagRefused.count];
+        for (NSString *x in gDiagRefused) [s appendFormat:@"   %@\n", x];
+    }
+    return s;
+}
+
 static void WXAREntry(void) {
     @autoreleasepool {
         WXARLogInit();
+        WXARDiagInit();
 
         NSString *bid = [NSBundle mainBundle].bundleIdentifier;
+
+        // 包名不对时也弹窗：这样能立刻发现「多开改过包名」这种情况
         if (!bid || ![bid isEqualToString:@WXAR_TARGET_BID]) {
             NSLog(@"[anti-revoke] 非微信进程 (%@)，不启用", bid);
+            WXARPopupWhenReady(@"⚠️ 防撤回未启用",
+                [NSString stringWithFormat:
+                    @"当前进程的 Bundle ID 不是微信：\n\n%@\n\n期望值：%s\n\n"
+                    @"如果是改过包名的多开微信，需要改代码里的 WXAR_TARGET_BID 再重新编译。",
+                    bid ? bid : @"(nil)", WXAR_TARGET_BID], 8);
             return;
         }
 
@@ -379,7 +642,27 @@ static void WXAREntry(void) {
                 });
         }
 
-        // 全部重试结束后，在后台队列跑一次全量扫描，把候选写进日志
+        // 所有重试跑完后弹诊断报告（诊断版特有，正式版会去掉）
+        dispatch_after(
+            dispatch_time(DISPATCH_TIME_NOW, (int64_t)(12.0 * NSEC_PER_SEC)),
+            dispatch_get_main_queue(), ^{
+                @autoreleasepool {
+                    WXARPopup(@"微信防撤回 · 诊断报告",
+                              WXARBuildDiagReport(bid));
+                }
+            });
+
+        // 观察模式：必须等候选表的所有重试跑完（最后一轮在 10 秒）之后再装。
+        // 否则观察桩会先占住 SEL，导致候选表的「阻止桩」装不上去。
+        dispatch_after(
+            dispatch_time(DISPATCH_TIME_NOW, (int64_t)(11.0 * NSEC_PER_SEC)),
+            dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+                @autoreleasepool {
+                    WXARInstallObservers();
+                }
+            });
+
+        // 顺带在后台跑一次全量扫描，把候选写进日志
         dispatch_after(
             dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30.0 * NSEC_PER_SEC)),
             dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
