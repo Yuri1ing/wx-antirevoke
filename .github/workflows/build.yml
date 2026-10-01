@@ -1,0 +1,37 @@
+name: Build anti-revoke dylib
+
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 查看工具链
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+
+      - name: 编译 dylib
+        env:
+          MIN_IOS: "15.0"
+          # 微信 8.0.75 的 IPA 里只有 arm64 一个 slice，编 arm64 即可。
+          # 额外编 arm64e 反而会引入 PAC 指针签名的额外风险。
+          ARCHS: "arm64"
+        run: |
+          chmod +x build.sh
+          ./build.sh
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: wxantirevoke-dylib
+          path: |
+            build/wxantirevoke.dylib
+          if-no-files-found: error
+          retention-days: 30

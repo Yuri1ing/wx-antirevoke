@@ -1,0 +1,16 @@
+# 微信 IPA 本体，绝不进版本库（800MB 且涉及版权）
+ipa/
+
+# 从 IPA 解出来的主二进制缓存（503MB，只在本地分析时用）
+*.macho
+
+# 编译产物
+build/
+*.dylib
+*.o
+
+# 系统垃圾
+.DS_Store
+Thumbs.db
+__pycache__/
+*.pyc
