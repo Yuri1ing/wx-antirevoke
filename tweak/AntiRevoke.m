@@ -222,16 +222,145 @@ static Method WXAROwnMethod(Class cls, SEL sel) {
 
 // ---- 桩函数：按原方法返回类型选用 -------------------------------------
 
+// ===========================================================================
+#pragma mark - 撤回提示（往聊天框里插一条本地提示消息）
+//
+// 因为我们拦住了原实现，微信自己那条「XXX撤回了一条消息」也不会出现。
+// 这里用微信现成的 API 自己补一条：
+//     CMessageWrap  -initWithMsgType:       （0x2710 = 10000，系统提示类型）
+//     CMessageMgr   -AddLocalMsg:MsgWrap:fixTime:NewMsgArriveNotify:
+// 两个都在 8.0.75 的符号表里实测存在。
+//
+// 全程 @try 保护 + respondsToSelector 校验：任何一环拿不到就安静放弃，
+// 退化成「无提示的防撤回」，绝不让微信崩。
+
+/// 取 <tag>...</tag> 之间的内容
+static NSString *WXARTagValue(NSString *xml, NSString *tag) {
+    if (!xml || !tag) return nil;
+    NSString *open  = [NSString stringWithFormat:@"<%@>", tag];
+    NSString *close = [NSString stringWithFormat:@"</%@>", tag];
+    NSRange r1 = [xml rangeOfString:open];
+    if (r1.location == NSNotFound) return nil;
+    NSUInteger start = r1.location + r1.length;
+    if (start > xml.length) return nil;
+    NSRange r2 = [xml rangeOfString:close options:0
+                              range:NSMakeRange(start, xml.length - start)];
+    if (r2.location == NSNotFound) return nil;
+    return [xml substringWithRange:NSMakeRange(start, r2.location - start)];
+}
+
+/// 拿 CMessageMgr 单例。走两条路，都不行就返回 nil。
+static id WXARMessageMgr(void) {
+    static id cached = nil;
+    static BOOL tried = NO;
+    if (tried) return cached;
+    tried = YES;
+
+    @try {
+        Class centerCls = objc_getClass("MMServiceCenter");
+        SEL defSel = NSSelectorFromString(@"defaultCenter");
+        if (centerCls && [centerCls respondsToSelector:defSel]) {
+            id center = ((id (*)(id, SEL))objc_msgSend)(centerCls, defSel);
+            SEL getSel = NSSelectorFromString(@"getService:");
+            if (center && [center respondsToSelector:getSel]) {
+                cached = ((id (*)(id, SEL, Class))objc_msgSend)(
+                    center, getSel, objc_getClass("CMessageMgr"));
+            }
+        }
+        if (!cached) {
+            Class mgrCls = objc_getClass("CMessageMgr");
+            SEL shSel = NSSelectorFromString(@"sharedInstance");
+            if (mgrCls && [mgrCls respondsToSelector:shSel]) {
+                cached = ((id (*)(id, SEL))objc_msgSend)(mgrCls, shSel);
+            }
+        }
+    } @catch (NSException *e) {
+        WXARLog(@"获取 CMessageMgr 失败：%@", e.reason);
+    }
+    if (cached) WXARLog(@"已拿到 CMessageMgr，撤回提示功能可用");
+    return cached;
+}
+
+/// 同一个会话 2 秒内只插一条，避免多个 hook 点重复触发时刷屏
+static BOOL WXARTipAllowed(NSString *session) {
+    if (session.length == 0) return NO;
+    static NSMutableDictionary<NSString *, NSNumber *> *lastTime = nil;
+    if (!lastTime) lastTime = [NSMutableDictionary dictionary];
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    NSNumber *last = lastTime[session];
+    if (last && now - last.doubleValue < 2.0) return NO;
+    lastTime[session] = @(now);
+    if (lastTime.count > 200) [lastTime removeAllObjects];   // 防膨胀
+    return YES;
+}
+
+/// 尝试往聊天框里插一条「拦截了撤回」的提示
+static void WXARTryInsertRevokeTip(id arg) {
+    @try {
+        if (!arg) return;
+
+        // 1) 从参数里掏 session 和原始内容（参数可能是 CMessageWrap，也可能是 XML 字符串）
+        NSString *session = nil;
+        NSString *content = nil;
+        if ([arg respondsToSelector:NSSelectorFromString(@"m_nsFromUsr")]) {
+            session = [arg valueForKey:@"m_nsFromUsr"];
+        }
+        if ([arg respondsToSelector:NSSelectorFromString(@"m_nsContent")]) {
+            content = [arg valueForKey:@"m_nsContent"];
+        }
+        if (!content && [arg isKindOfClass:[NSString class]]) {
+            content = (NSString *)arg;
+        }
+        if (session.length == 0 && content) {
+            session = WXARTagValue(content, @"session");
+        }
+        if (session.length == 0) return;
+        if (!WXARTipAllowed(session)) return;
+
+        // 2) 构造一条系统提示消息
+        Class wrapCls = objc_getClass("CMessageWrap");
+        if (!wrapCls) return;
+        id tip = ((id (*)(id, SEL, long long))objc_msgSend)(
+            [wrapCls alloc], NSSelectorFromString(@"initWithMsgType:"), 0x2710LL);
+        if (!tip) return;
+
+        [tip setValue:session forKey:@"m_nsFromUsr"];
+        [tip setValue:session forKey:@"m_nsToUsr"];
+        [tip setValue:@"对方撤回了一条消息（已被防撤回拦截，原消息保留）"
+                forKey:@"m_nsContent"];
+        [tip setValue:@(0x4) forKey:@"m_uiStatus"];
+        [tip setValue:@((uint32_t)[[NSDate date] timeIntervalSince1970])
+                forKey:@"m_uiCreateTime"];
+
+        // 3) 交给消息管理器写进本地会话
+        id mgr = WXARMessageMgr();
+        if (!mgr) return;
+        SEL addSel = NSSelectorFromString(@"AddLocalMsg:MsgWrap:fixTime:NewMsgArriveNotify:");
+        if (![mgr respondsToSelector:addSel]) {
+            WXARLog(@"CMessageMgr 没有 AddLocalMsg:MsgWrap:fixTime:NewMsgArriveNotify:");
+            return;
+        }
+        ((void (*)(id, SEL, id, id, BOOL, BOOL))objc_msgSend)(
+            mgr, addSel, session, tip, YES, NO);
+        WXARLog(@"✅ 已插入撤回提示：session=%@", session);
+    } @catch (NSException *e) {
+        WXARLog(@"插入撤回提示失败：%@", e.reason);
+    }
+}
+
 static void WXARNoteHit(id self, SEL _cmd, id arg) {
     const char *argCls = "nil";
     if (arg) {
         // 用 C 函数取类名，比发消息更轻、更不容易出意外
         argCls = object_getClassName(arg);
     }
-    NSString *desc = [NSString stringWithFormat:@"%@ -%@\n参数类型: %s",
+    NSString *desc = [NSString stringWithFormat:@"%@ -%@  参数类型: %s",
                       NSStringFromClass([self class]),
                       NSStringFromSelector(_cmd), argCls];
     WXARLog(@"🛡 已拦截撤回  %@", desc);
+
+    // 往聊天框里补一条提示（失败也不会影响防撤回本身）
+    WXARTryInsertRevokeTip(arg);
 
     // 诊断版：真的拦到撤回时弹窗报喜，最多弹 5 次免得刷屏
     if (gDiagHitPopupCount < 5) {

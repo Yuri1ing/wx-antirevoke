@@ -30,7 +30,7 @@ order = []
 cur = None
 with open(path, "r", encoding="utf-8", errors="replace") as f:
     for line in f:
-        if line.startswith("    - "):
+        if line.startswith("    - ") or line.startswith("    + "):
             if cur is None:
                 continue
             body = line[6:].rstrip("\n")
