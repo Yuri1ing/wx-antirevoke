@@ -441,9 +441,6 @@ static id WXARMessageMgrFrom(id hint) {
     return cached;
 }
 
-/// 兼容旧调用点
-static id WXARMessageMgr(void) { return WXARMessageMgrFrom(nil); }
-
 /// 同一个会话 2 秒内只插一条，避免多个 hook 点重复触发时刷屏
 static BOOL WXARTipAllowed(NSString *session) {
     if (session.length == 0) return NO;
