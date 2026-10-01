@@ -54,6 +54,12 @@
 // 日志文件超过这个大小就清空重建，避免无限增长
 #define WXAR_MAX_LOG_SIZE (512 * 1024)
 
+// 诊断开关。
+//   1 = 启动弹诊断窗、撤回时弹观察窗、并安装观察模式（排错用）
+//   0 = 正式版：不弹任何窗、不装观察模式，只把信息静默写进日志
+// 已经验证过 4 个入口全部命中，所以正式版关掉这些干扰。
+#define WXAR_DIAGNOSTIC  0
+
 // 延迟重试的轮次（秒）。微信的类大多在启动阶段就注册好了，
 // 留几轮是为了兜底那些懒加载的控制器。
 static const double kRetryDelays[] = {0.0, 1.0, 3.0, 6.0, 10.0};
@@ -157,7 +163,11 @@ static UIViewController *WXARTopViewController(void) {
 }
 
 /// 弹一个提示。可能被微信的 UI 挡住或者当时还没有窗口，所以失败就静默放弃。
+///
+/// 正式版（WXAR_DIAGNOSTIC = 0）不弹窗，只把内容写进日志 —— 所有诊断信息都
+/// 汇总在这里，所以改这一个地方就能让全部弹窗消失。
 static void WXARPopup(NSString *title, NSString *message) {
+#if WXAR_DIAGNOSTIC
     dispatch_async(dispatch_get_main_queue(), ^{
         @try {
             UIViewController *top = WXARTopViewController();
@@ -174,6 +184,9 @@ static void WXARPopup(NSString *title, NSString *message) {
             // 弹不出来绝不能影响微信本身
         }
     });
+#else
+    WXARLog(@"[诊断] %@ —— %@", title, message);
+#endif
 }
 
 /// 反复尝试弹窗，直到拿到可用的 view controller（最多 12 次，每次隔 1 秒）
@@ -449,6 +462,11 @@ static BOOL WXARSwizzleObserve(Class cls, SEL sel) {
 }
 
 static int WXARInstallObservers(void) {
+#if !WXAR_DIAGNOSTIC
+    // 正式版不装观察模式。它会额外包装几百个方法（虽然只记录、照常调用原实现，
+    // 行为不变），但对日常使用是多余的负担，装它只是为了当初定位撤回入口。
+    return 0;
+#else
     int installed = 0;
     int count = objc_getClassList(NULL, 0);
     if (count <= 0) return 0;
@@ -478,6 +496,7 @@ static int WXARInstallObservers(void) {
     free(classes);
     WXARLog(@"观察模式：包装了 %d 个方法", installed);
     return installed;
+#endif
 }
 
 // ===========================================================================
