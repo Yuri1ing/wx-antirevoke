@@ -234,6 +234,26 @@ static Method WXAROwnMethod(Class cls, SEL sel) {
 // 全程 @try 保护 + respondsToSelector 校验：任何一环拿不到就安静放弃，
 // 退化成「无提示的防撤回」，绝不让微信崩。
 
+/// 无视诊断开关，强制弹窗。只给「撤回提示」这一个功能排错时用。
+static void WXARPopupForce(NSString *title, NSString *message) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @try {
+            UIViewController *top = WXARTopViewController();
+            if (!top) return;
+            UIAlertController *ac =
+                [UIAlertController alertControllerWithTitle:title
+                                                    message:message
+                                             preferredStyle:UIAlertControllerStyleAlert];
+            [ac addAction:[UIAlertAction actionWithTitle:@"知道了"
+                                                   style:UIAlertActionStyleDefault
+                                                 handler:nil]];
+            [top presentViewController:ac animated:YES completion:nil];
+        } @catch (NSException *e) {
+            // 弹不出来也不能影响微信
+        }
+    });
+}
+
 /// 取 <tag>...</tag> 之间的内容
 static NSString *WXARTagValue(NSString *xml, NSString *tag) {
     if (!xml || !tag) return nil;
@@ -249,34 +269,73 @@ static NSString *WXARTagValue(NSString *xml, NSString *tag) {
     return [xml substringWithRange:NSMakeRange(start, r2.location - start)];
 }
 
-/// 拿 CMessageMgr 单例。走两条路，都不行就返回 nil。
+/// 撤回提示专用的排错上报：第一次失败时弹窗，把原因和探测到的信息一起给出
+static NSString *gTipDiag = nil;
+static BOOL gTipDiagShown = NO;
+
+static void WXARTipFail(NSString *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    va_end(ap);
+
+    WXARLog(@"撤回提示失败：%@", msg);
+    if (gTipDiagShown) return;
+    gTipDiagShown = YES;
+
+    NSMutableString *full = [NSMutableString stringWithString:msg];
+    if (gTipDiag.length) [full appendFormat:@"\n\n—— 探测信息 ——\n%@", gTipDiag];
+    WXARPopupForce(@"⚠️ 撤回提示没插进去", full);
+}
+
+/// 拿 CMessageMgr 单例。多条路都试，失败时把每一步的探测结果记下来。
 static id WXARMessageMgr(void) {
     static id cached = nil;
     static BOOL tried = NO;
     if (tried) return cached;
     tried = YES;
 
+    NSMutableString *diag = [NSMutableString string];
     @try {
         Class centerCls = objc_getClass("MMServiceCenter");
-        SEL defSel = NSSelectorFromString(@"defaultCenter");
-        if (centerCls && [centerCls respondsToSelector:defSel]) {
-            id center = ((id (*)(id, SEL))objc_msgSend)(centerCls, defSel);
-            SEL getSel = NSSelectorFromString(@"getService:");
-            if (center && [center respondsToSelector:getSel]) {
-                cached = ((id (*)(id, SEL, Class))objc_msgSend)(
-                    center, getSel, objc_getClass("CMessageMgr"));
+        [diag appendFormat:@"MMServiceCenter 类：%@\n", centerCls ? @"存在" : @"不存在"];
+        if (centerCls) {
+            SEL defSel = NSSelectorFromString(@"defaultCenter");
+            BOOL hasDef = [centerCls respondsToSelector:defSel];
+            [diag appendFormat:@"  +defaultCenter：%@\n", hasDef ? @"有" : @"没有"];
+            if (hasDef) {
+                id center = ((id (*)(id, SEL))objc_msgSend)(centerCls, defSel);
+                [diag appendFormat:@"  center 实例：%@\n", center ? @"拿到" : @"nil"];
+                SEL getSel = NSSelectorFromString(@"getService:");
+                BOOL hasGet = center && [center respondsToSelector:getSel];
+                [diag appendFormat:@"  -getService:：%@\n", hasGet ? @"有" : @"没有"];
+                if (hasGet) {
+                    cached = ((id (*)(id, SEL, Class))objc_msgSend)(
+                        center, getSel, objc_getClass("CMessageMgr"));
+                    [diag appendFormat:@"  getService:CMessageMgr → %@\n",
+                                       cached ? @"拿到" : @"nil"];
+                }
             }
         }
+
         if (!cached) {
             Class mgrCls = objc_getClass("CMessageMgr");
-            SEL shSel = NSSelectorFromString(@"sharedInstance");
-            if (mgrCls && [mgrCls respondsToSelector:shSel]) {
-                cached = ((id (*)(id, SEL))objc_msgSend)(mgrCls, shSel);
+            [diag appendFormat:@"CMessageMgr 类：%@\n", mgrCls ? @"存在" : @"不存在"];
+            if (mgrCls) {
+                SEL shSel = NSSelectorFromString(@"sharedInstance");
+                BOOL hasSh = [mgrCls respondsToSelector:shSel];
+                [diag appendFormat:@"  +sharedInstance：%@\n", hasSh ? @"有" : @"没有"];
+                if (hasSh) {
+                    cached = ((id (*)(id, SEL))objc_msgSend)(mgrCls, shSel);
+                    [diag appendFormat:@"  sharedInstance → %@\n", cached ? @"拿到" : @"nil"];
+                }
             }
         }
     } @catch (NSException *e) {
-        WXARLog(@"获取 CMessageMgr 失败：%@", e.reason);
+        [diag appendFormat:@"探测时抛异常：%@\n", e.reason];
     }
+
+    gTipDiag = diag;
     if (cached) WXARLog(@"已拿到 CMessageMgr，撤回提示功能可用");
     return cached;
 }
@@ -297,7 +356,13 @@ static BOOL WXARTipAllowed(NSString *session) {
 /// 尝试往聊天框里插一条「拦截了撤回」的提示
 static void WXARTryInsertRevokeTip(id arg) {
     @try {
-        if (!arg) return;
+        if (!arg) {
+            WXARTipFail(@"拦截到的参数是 nil");
+            return;
+        }
+
+        NSMutableString *info = [NSMutableString string];
+        [info appendFormat:@"参数类型：%s\n", object_getClassName(arg)];
 
         // 1) 从参数里掏 session 和原始内容（参数可能是 CMessageWrap，也可能是 XML 字符串）
         NSString *session = nil;
@@ -311,18 +376,39 @@ static void WXARTryInsertRevokeTip(id arg) {
         if (!content && [arg isKindOfClass:[NSString class]]) {
             content = (NSString *)arg;
         }
+
+        [info appendFormat:@"m_nsFromUsr：%@\n", session.length ? session : @"(空)"];
+        if (content.length > 150) {
+            [info appendFormat:@"m_nsContent：%@…\n",
+                               [content substringToIndex:150]];
+        } else {
+            [info appendFormat:@"m_nsContent：%@\n", content.length ? content : @"(空)"];
+        }
+
         if (session.length == 0 && content) {
             session = WXARTagValue(content, @"session");
         }
-        if (session.length == 0) return;
-        if (!WXARTipAllowed(session)) return;
+        if (session.length == 0) {
+            gTipDiag = info;
+            WXARTipFail(@"从参数里取不到 session（会话标识）");
+            return;
+        }
+        if (!WXARTipAllowed(session)) return;   // 2 秒内重复，静默跳过
 
         // 2) 构造一条系统提示消息
         Class wrapCls = objc_getClass("CMessageWrap");
-        if (!wrapCls) return;
+        if (!wrapCls) {
+            gTipDiag = info;
+            WXARTipFail(@"找不到 CMessageWrap 类");
+            return;
+        }
         id tip = ((id (*)(id, SEL, long long))objc_msgSend)(
             [wrapCls alloc], NSSelectorFromString(@"initWithMsgType:"), 0x2710LL);
-        if (!tip) return;
+        if (!tip) {
+            gTipDiag = info;
+            WXARTipFail(@"CMessageWrap initWithMsgType: 创建失败");
+            return;
+        }
 
         [tip setValue:session forKey:@"m_nsFromUsr"];
         [tip setValue:session forKey:@"m_nsToUsr"];
@@ -334,17 +420,27 @@ static void WXARTryInsertRevokeTip(id arg) {
 
         // 3) 交给消息管理器写进本地会话
         id mgr = WXARMessageMgr();
-        if (!mgr) return;
-        SEL addSel = NSSelectorFromString(@"AddLocalMsg:MsgWrap:fixTime:NewMsgArriveNotify:");
-        if (![mgr respondsToSelector:addSel]) {
-            WXARLog(@"CMessageMgr 没有 AddLocalMsg:MsgWrap:fixTime:NewMsgArriveNotify:");
+        if (!mgr) {
+            // gTipDiag 已在 WXARMessageMgr 里填好
+            WXARTipFail(@"拿不到 CMessageMgr 实例");
             return;
         }
+        SEL addSel = NSSelectorFromString(@"AddLocalMsg:MsgWrap:fixTime:NewMsgArriveNotify:");
+        if (![mgr respondsToSelector:addSel]) {
+            gTipDiag = info;
+            WXARTipFail(@"CMessageMgr 不响应 AddLocalMsg:MsgWrap:fixTime:NewMsgArriveNotify:");
+            return;
+        }
+
         ((void (*)(id, SEL, id, id, BOOL, BOOL))objc_msgSend)(
             mgr, addSel, session, tip, YES, NO);
         WXARLog(@"✅ 已插入撤回提示：session=%@", session);
+        WXARPopupForce(@"✅ 撤回提示已插入",
+                       [NSString stringWithFormat:@"session：%@\n\n如果聊天框里没看到，"
+                        @"说明消息插进去了但没显示，那是消息类型/状态字段的问题。",
+                        session]);
     } @catch (NSException *e) {
-        WXARLog(@"插入撤回提示失败：%@", e.reason);
+        WXARTipFail(@"插入过程抛异常：%@", e.reason);
     }
 }
 
