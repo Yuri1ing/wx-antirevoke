@@ -242,6 +242,11 @@ static Method WXAROwnMethod(Class cls, SEL sel) {
 // 所以「主动获取」这条路是死的。改成**反向捕获**：hook CMessageMgr 自己的方法，
 // 等微信正常调用它时，把 self 记下来。
 
+// 下面这两个工具函数定义在后面的「观察模式」一节里，
+// 但捕获桩要先用，所以这里先做前置声明。
+static IMP  WXARObserveOriginal(SEL sel);
+static BOOL WXARIsVoidOneObjectArg(const char *types);
+
 static id gCachedMessageMgr = nil;
 
 static void WXARCacheMessageMgr(id mgr) {
