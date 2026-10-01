@@ -288,55 +288,156 @@ static void WXARTipFail(NSString *fmt, ...) {
     WXARPopupForce(@"⚠️ 撤回提示没插进去", full);
 }
 
-/// 拿 CMessageMgr 单例。多条路都试，失败时把每一步的探测结果记下来。
-static id WXARMessageMgr(void) {
+/// 把一个类的所有「类方法」名字收集进诊断串（限 40 条，避免弹窗过长）
+static void WXARCollectClassMethods(Class cls, NSString *label, NSMutableString *out) {
+    if (!cls) return;
+    Class meta = object_getClass(cls);
+    unsigned int count = 0;
+    Method *methods = class_copyMethodList(meta, &count);
+    if (!methods) return;
+    [out appendFormat:@"%@ 类方法 (%u)：\n", label, count];
+    for (unsigned int i = 0; i < count && i < 40; i++) {
+        const char *types = method_getTypeEncoding(methods[i]);
+        [out appendFormat:@"  +%s [%s]\n",
+                          sel_getName(method_getName(methods[i])),
+                          types ? types : "?"];
+    }
+    free(methods);
+}
+
+/// 自动找单例：遍历 cls 的类方法，只调用「无参数且返回对象」(类型编码 @16@0:8) 的，
+/// 看哪一个返回的对象能响应 -getService:。
+/// 这样就不用去猜 defaultCenter / sharedInstance 这些名字了。
+static id WXARAutoFindSingleton(Class cls, NSMutableString *diag) {
+    if (!cls) return nil;
+    Class meta = object_getClass(cls);
+    unsigned int count = 0;
+    Method *methods = class_copyMethodList(meta, &count);
+    if (!methods) return nil;
+
+    SEL getSel = NSSelectorFromString(@"getService:");
+    id found = nil;
+    for (unsigned int i = 0; i < count; i++) {
+        SEL sel = method_getName(methods[i]);
+        const char *types = method_getTypeEncoding(methods[i]);
+        if (!types || types[0] != '@') continue;
+        if (strcmp(types, "@16@0:8") != 0) continue;   // 必须无参数
+        @try {
+            id obj = ((id (*)(id, SEL))objc_msgSend)(cls, sel);
+            if (!obj) continue;
+            [diag appendFormat:@"  调用 +%s 得到 %s\n",
+                               sel_getName(sel), object_getClassName(obj)];
+            if (!found && [obj respondsToSelector:getSel]) {
+                found = obj;
+                [diag appendFormat:@"    ↑ 它能响应 getService:，采用它\n"];
+            }
+        } @catch (NSException *e) {
+            [diag appendFormat:@"  调用 +%s 抛异常\n", sel_getName(sel)];
+        }
+    }
+    free(methods);
+    return found;
+}
+
+/// 从某个实例的 ivar 里找 CMessageMgr（有些 Manager 直接持有消息管理器）
+static id WXARFindMgrInIvars(id obj, NSMutableString *diag) {
+    if (!obj) return nil;
+    Class cls = object_getClass(obj);
+    Class mgrCls = objc_getClass("CMessageMgr");
+    unsigned int count = 0;
+    Ivar *ivars = class_copyIvarList(cls, &count);
+    if (!ivars) return nil;
+    id found = nil;
+    for (unsigned int i = 0; i < count; i++) {
+        const char *iname = ivar_getName(ivars[i]);
+        const char *itype = ivar_getTypeEncoding(ivars[i]);
+        @try {
+            id val = object_getIvar(obj, ivars[i]);
+            if (!val) continue;
+            [diag appendFormat:@"  ivar %s [%s] → %s\n", iname ? iname : "?",
+                               itype ? itype : "?", object_getClassName(val)];
+            if (!found && mgrCls && [val isKindOfClass:mgrCls]) {
+                found = val;
+                [diag appendFormat:@"    ↑ 命中 CMessageMgr\n"];
+            }
+        } @catch (NSException *e) {
+            // 忽略取不到的 ivar
+        }
+    }
+    free(ivars);
+    return found;
+}
+
+/// 拿 CMessageMgr 单例。
+/// hint 是调用方的实例（MessageRevokeMgr 之类），用于最后一招：翻它的 ivar。
+static id WXARMessageMgrFrom(id hint) {
     static id cached = nil;
     static BOOL tried = NO;
     if (tried) return cached;
     tried = YES;
 
     NSMutableString *diag = [NSMutableString string];
+    Class mgrCls = objc_getClass("CMessageMgr");
+    Class centerCls = objc_getClass("MMServiceCenter");
+    [diag appendFormat:@"CMessageMgr 类：%@   MMServiceCenter 类：%@\n\n",
+                       mgrCls ? @"有" : @"无", centerCls ? @"有" : @"无"];
+
     @try {
-        Class centerCls = objc_getClass("MMServiceCenter");
-        [diag appendFormat:@"MMServiceCenter 类：%@\n", centerCls ? @"存在" : @"不存在"];
-        if (centerCls) {
-            SEL defSel = NSSelectorFromString(@"defaultCenter");
-            BOOL hasDef = [centerCls respondsToSelector:defSel];
-            [diag appendFormat:@"  +defaultCenter：%@\n", hasDef ? @"有" : @"没有"];
-            if (hasDef) {
-                id center = ((id (*)(id, SEL))objc_msgSend)(centerCls, defSel);
-                [diag appendFormat:@"  center 实例：%@\n", center ? @"拿到" : @"nil"];
-                SEL getSel = NSSelectorFromString(@"getService:");
-                BOOL hasGet = center && [center respondsToSelector:getSel];
-                [diag appendFormat:@"  -getService:：%@\n", hasGet ? @"有" : @"没有"];
-                if (hasGet) {
-                    cached = ((id (*)(id, SEL, Class))objc_msgSend)(
-                        center, getSel, objc_getClass("CMessageMgr"));
-                    [diag appendFormat:@"  getService:CMessageMgr → %@\n",
-                                       cached ? @"拿到" : @"nil"];
-                }
+        // 途径 1：常见单例名硬试
+        NSArray<NSString *> *names = @[@"defaultCenter", @"sharedInstance",
+                                       @"defaultInstance", @"sharedCenter",
+                                       @"getInstance", @"instance", @"shared"];
+        id center = nil;
+        for (NSString *n in names) {
+            SEL s = NSSelectorFromString(n);
+            if (centerCls && [centerCls respondsToSelector:s]) {
+                center = ((id (*)(id, SEL))objc_msgSend)(centerCls, s);
+                [diag appendFormat:@"MMServiceCenter +%@ → %@\n", n,
+                                   center ? @"拿到" : @"nil"];
+                if (center) break;
+            }
+        }
+        SEL getSel = NSSelectorFromString(@"getService:");
+        if (center && [center respondsToSelector:getSel] && mgrCls) {
+            cached = ((id (*)(id, SEL, Class))objc_msgSend)(center, getSel, mgrCls);
+            [diag appendFormat:@"getService:CMessageMgr → %@\n", cached ? @"拿到" : @"nil"];
+        }
+
+        // 途径 2：自动扫描 MMServiceCenter 的类方法
+        if (!cached) {
+            [diag appendString:@"\n--- 自动扫描 MMServiceCenter ---\n"];
+            id auto1 = WXARAutoFindSingleton(centerCls, diag);
+            if (auto1 && [auto1 respondsToSelector:getSel] && mgrCls) {
+                cached = ((id (*)(id, SEL, Class))objc_msgSend)(auto1, getSel, mgrCls);
+                [diag appendFormat:@"自动途径 getService:CMessageMgr → %@\n",
+                                   cached ? @"拿到" : @"nil"];
             }
         }
 
+        // 途径 3：自动扫描 CMessageMgr 自己的类方法
         if (!cached) {
-            Class mgrCls = objc_getClass("CMessageMgr");
-            [diag appendFormat:@"CMessageMgr 类：%@\n", mgrCls ? @"存在" : @"不存在"];
-            if (mgrCls) {
-                SEL shSel = NSSelectorFromString(@"sharedInstance");
-                BOOL hasSh = [mgrCls respondsToSelector:shSel];
-                [diag appendFormat:@"  +sharedInstance：%@\n", hasSh ? @"有" : @"没有"];
-                if (hasSh) {
-                    cached = ((id (*)(id, SEL))objc_msgSend)(mgrCls, shSel);
-                    [diag appendFormat:@"  sharedInstance → %@\n", cached ? @"拿到" : @"nil"];
-                }
-            }
+            [diag appendString:@"\n--- 自动扫描 CMessageMgr ---\n"];
+            cached = WXARAutoFindSingleton(mgrCls, diag);
+        }
+
+        // 途径 4：翻调用方实例的 ivar（很多 Manager 直接持有消息管理器）
+        if (!cached && hint) {
+            [diag appendString:@"\n--- 翻调用方 ivar ---\n"];
+            cached = WXARFindMgrInIvars(hint, diag);
+        }
+
+        // 途径 5：都没找到，列出类方法供人工判断
+        if (!cached) {
+            [diag appendString:@"\n--- 未找到，列出类方法供人工判断 ---\n"];
+            WXARCollectClassMethods(centerCls, @"MMServiceCenter", diag);
+            WXARCollectClassMethods(mgrCls, @"CMessageMgr", diag);
         }
     } @catch (NSException *e) {
         [diag appendFormat:@"探测时抛异常：%@\n", e.reason];
     }
 
     gTipDiag = diag;
-    if (cached) WXARLog(@"已拿到 CMessageMgr，撤回提示功能可用");
+    if (cached) WXARLog(@"已拿到 CMessageMgr");
     return cached;
 }
 
@@ -354,7 +455,7 @@ static BOOL WXARTipAllowed(NSString *session) {
 }
 
 /// 尝试往聊天框里插一条「拦截了撤回」的提示
-static void WXARTryInsertRevokeTip(id arg) {
+static void WXARTryInsertRevokeTip(id owner, id arg) {
     @try {
         if (!arg) {
             WXARTipFail(@"拦截到的参数是 nil");
@@ -419,7 +520,7 @@ static void WXARTryInsertRevokeTip(id arg) {
                 forKey:@"m_uiCreateTime"];
 
         // 3) 交给消息管理器写进本地会话
-        id mgr = WXARMessageMgr();
+        id mgr = WXARMessageMgrFrom(owner);
         if (!mgr) {
             // gTipDiag 已在 WXARMessageMgr 里填好
             WXARTipFail(@"拿不到 CMessageMgr 实例");
@@ -456,7 +557,7 @@ static void WXARNoteHit(id self, SEL _cmd, id arg) {
     WXARLog(@"🛡 已拦截撤回  %@", desc);
 
     // 往聊天框里补一条提示（失败也不会影响防撤回本身）
-    WXARTryInsertRevokeTip(arg);
+    WXARTryInsertRevokeTip(self, arg);
 
     // 诊断版：真的拦到撤回时弹窗报喜，最多弹 5 次免得刷屏
     if (gDiagHitPopupCount < 5) {
