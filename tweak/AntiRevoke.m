@@ -60,6 +60,10 @@
 // 已经验证过 4 个入口全部命中，所以正式版关掉这些干扰。
 #define WXAR_DIAGNOSTIC  0
 
+// 「撤回提示」这个功能单独的排错开关。它独立于上面的总开关，
+// 因为提示功能最后才做通，排错信息最密集。正式版设为 0。
+#define WXAR_TIP_DIAGNOSTIC  0
+
 // 延迟重试的轮次（秒）。微信的类大多在启动阶段就注册好了，
 // 留几轮是为了兜底那些懒加载的控制器。
 static const double kRetryDelays[] = {0.0, 1.0, 3.0, 6.0, 10.0};
@@ -377,12 +381,14 @@ static void WXARTipFail(NSString *fmt, ...) {
     va_end(ap);
 
     WXARLog(@"撤回提示失败：%@", msg);
+#if WXAR_TIP_DIAGNOSTIC
     if (gTipDiagShown) return;
     gTipDiagShown = YES;
 
     NSMutableString *full = [NSMutableString stringWithString:msg];
     if (gTipDiag.length) [full appendFormat:@"\n\n—— 探测信息 ——\n%@", gTipDiag];
     WXARPopupForce(@"⚠️ 撤回提示没插进去", full);
+#endif
 }
 
 /// 把一个类的所有「类方法」名字收集进诊断串（限 40 条，避免弹窗过长）
@@ -611,10 +617,31 @@ static void WXARTryInsertRevokeTip(id owner, id arg) {
             return;
         }
 
+        // 提示文案优先用微信自己生成的 <replacemsg>：
+        // 它在私聊里是「对方」，在群聊里会带上具体昵称，比我们自己拼「对方」准确得多。
+        NSString *tipText = WXARTagValue(content, @"replacemsg");
+        if (tipText.length == 0) {
+            // 退一步：从 CDATA 里抠出「XXX撤回了一条消息」
+            NSString *src = content ? content : @"";
+            NSRegularExpression *re = [NSRegularExpression
+                regularExpressionWithPattern:@"<!\\[CDATA\\[(.*?撤回.*?)\\]\\]>"
+                                     options:NSRegularExpressionCaseInsensitive
+                                       error:nil];
+            NSTextCheckingResult *m = [re firstMatchInString:src
+                                                     options:0
+                                                       range:NSMakeRange(0, src.length)];
+            if (m && m.numberOfRanges >= 2) {
+                tipText = [src substringWithRange:[m rangeAtIndex:1]];
+            }
+        }
+        if (tipText.length == 0) {
+            tipText = @"对方撤回了一条消息";
+        }
+        tipText = [tipText stringByAppendingString:@"（已被防撤回拦截，原消息保留）"];
+
         [tip setValue:session forKey:@"m_nsFromUsr"];
         [tip setValue:session forKey:@"m_nsToUsr"];
-        [tip setValue:@"对方撤回了一条消息（已被防撤回拦截，原消息保留）"
-                forKey:@"m_nsContent"];
+        [tip setValue:tipText forKey:@"m_nsContent"];
         [tip setValue:@(0x4) forKey:@"m_uiStatus"];
         [tip setValue:@((uint32_t)[[NSDate date] timeIntervalSince1970])
                 forKey:@"m_uiCreateTime"];
@@ -636,10 +663,12 @@ static void WXARTryInsertRevokeTip(id owner, id arg) {
         ((void (*)(id, SEL, id, id, BOOL, BOOL))objc_msgSend)(
             mgr, addSel, session, tip, YES, NO);
         WXARLog(@"✅ 已插入撤回提示：session=%@", session);
+#if WXAR_TIP_DIAGNOSTIC
         WXARPopupForce(@"✅ 撤回提示已插入",
                        [NSString stringWithFormat:@"session：%@\n\n如果聊天框里没看到，"
                         @"说明消息插进去了但没显示，那是消息类型/状态字段的问题。",
                         session]);
+#endif
     } @catch (NSException *e) {
         WXARTipFail(@"插入过程抛异常：%@", e.reason);
     }
