@@ -1044,7 +1044,7 @@ static NSString *WXARDescribeSubviews(UIView *v) {
     NSMutableString *s = [NSMutableString string];
     NSArray<UIView *> *subs = v.subviews;
     [s appendFormat:@"子视图 %lu 个：\n", (unsigned long)subs.count];
-    NSUInteger n = subs.count > 10 ? 10 : subs.count;
+    NSUInteger n = subs.count > 15 ? 15 : subs.count;
     for (NSUInteger i = 0; i < n; i++) {
         UIView *sub = subs[i];
         UIColor *bg = sub.backgroundColor;
@@ -1164,18 +1164,32 @@ static void WXARApplyGlassToView(UIView *bar) {
         bar.backgroundColor = [UIColor clearColor];
     }
 
-    // 3) 逐个子视图：任何不透明的纯背景层都会把玻璃挡住，一律调透明。
-    //    这里只动 backgroundColor —— 图标是 UIImageView（背景本来就是 nil），
-    //    微信自绘的 UIVisualEffectView 通常也没有 backgroundColor，都不会被误伤。
+    // 3) 逐个子视图清理遮挡。
+    //
+    //    真机实测：MMTabBar 里第 0 层是微信自己的 UIVisualEffectView（α1.00），
+    //    正好盖在玻璃上面。而 UIVisualEffectView 的外观来自 `effect` 属性，
+    //    光设 backgroundColor 对它没用 —— 必须把 effect 拿掉并隐藏。
+    //    其余层是普通背景色，调透明即可。
     for (UIView *sub in bar.subviews) {
         if (sub == glass) continue;
         @try {
+            if ([sub isKindOfClass:[UIVisualEffectView class]]) {
+                UIVisualEffectView *ve = (UIVisualEffectView *)sub;
+                ve.effect = nil;
+                ve.backgroundColor = [UIColor clearColor];
+                ve.hidden = YES;              // 让我们的液态玻璃露出来
+                continue;
+            }
             UIColor *bg = sub.backgroundColor;
             if (bg && CGColorGetAlpha(bg.CGColor) > 0.01) {
                 sub.backgroundColor = [UIColor clearColor];
             }
         } @catch (NSException *e) { }
     }
+
+    // 4) 某些布局周期里微信会重排子视图，把玻璃挤到后面去。
+    //    每次都重新插回底层，保证它一直在最下面。
+    [bar insertSubview:glass atIndex:0];
 
     // 装好了才报告，并把子视图层级一起带上
     if (glass && !gGlassReported) {
