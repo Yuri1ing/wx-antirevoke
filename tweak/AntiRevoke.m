@@ -974,6 +974,157 @@ static int WXARInstallObservers(void) {
 }
 
 // ===========================================================================
+#pragma mark - 转发 hook 基础设施
+
+/// 按 (类, 方法) 精确取回原实现。
+///
+/// 为什么不能只按 SEL：像 `layoutSubviews` 这种每个 UIView 都有的方法，
+/// 只按 SEL 查找会命中别的类记录的那条，拿到错误的 IMP，一调用就崩。
+static IMP WXAROriginalForClass(Class cls, SEL sel) {
+    for (int i = 0; i < gHookCount; i++) {
+        if (gHooks[i].cls == cls && gHooks[i].sel == sel) return gHooks[i].original;
+    }
+    // 退一步：本类没记录时按 SEL 找（适用于只 hook 了父类的情形）
+    for (int i = 0; i < gHookCount; i++) {
+        if (gHooks[i].sel == sel) return gHooks[i].original;
+    }
+    return NULL;
+}
+
+/// 安装一个「转发桩」：新实现自己负责调用原实现，行为不改变，只是多做了点事。
+/// 与 WXARSwizzle 的区别是后者会拦断原实现（那是防撤回用的）。
+static BOOL WXARInstallForwarder(const char *clsName, const char *selName, IMP newImp) {
+    Class cls = objc_getClass(clsName);
+    if (!cls) return NO;
+
+    SEL sel = NSSelectorFromString([NSString stringWithUTF8String:selName]);
+    for (int i = 0; i < gHookCount; i++) {
+        if (gHooks[i].cls == cls && gHooks[i].sel == sel) return YES;   // 已装过
+    }
+    Method m = WXAROwnMethod(cls, sel);
+    if (!m) return NO;
+    if (gHookCount >= (int)(sizeof(gHooks) / sizeof(gHooks[0]))) return NO;
+
+    IMP original = method_setImplementation(m, newImp);
+    if (!original) return NO;
+
+    WXARHookRecord *rec = &gHooks[gHookCount++];
+    rec->cls = cls;
+    rec->sel = sel;
+    rec->original = original;
+    WXARLog(@"装上转发钩子：%@ -%@", [NSString stringWithUTF8String:clsName],
+            [NSString stringWithUTF8String:selName]);
+    return YES;
+}
+
+// ===========================================================================
+#pragma mark - 液态玻璃（底部栏）
+//
+// 目标：把微信主界面底部那条栏（微信/通讯录/发现/我）换成 iOS 26 的液态玻璃。
+//
+// 挂载点来自对 8.0.79 符号表的分析：`WCTabBarView`（55 个方法）就是那条栏，
+// 它自带一个 `backgroundContentView`（背景视图）和一个 `separatorView`（分隔线）。
+// 做法是把一个装了 UIGlassEffect 的 UIVisualEffectView 垫到最底层，
+// 再把微信自己的背景调成透明，让玻璃透出来。
+//
+// 只在 iOS 26+ 生效：UIGlassEffect 这个类是 iOS 26 才有的，
+// 低版本系统里 NSClassFromString 返回 nil，整段逻辑自动跳过。
+
+#define WXAR_GLASS_TAG   0x7A115300
+
+/// 把玻璃垫到某个栏的底层；幂等，重复调用只更新尺寸。
+static void WXARApplyGlassToView(UIView *bar) {
+    if (!bar) return;
+
+    // 先看是不是已经装过了
+    UIVisualEffectView *glass = nil;
+    for (UIView *sub in bar.subviews) {
+        if (sub.tag == WXAR_GLASS_TAG) {
+            glass = (UIVisualEffectView *)sub;
+            break;
+        }
+    }
+
+    if (!glass) {
+        Class glassCls = NSClassFromString(@"UIGlassEffect");
+        if (!glassCls) return;                 // 系统低于 iOS 26，安静跳过
+
+        id effect = nil;
+        @try {
+            effect = ((id (*)(id, SEL))objc_msgSend)([glassCls alloc],
+                                                     NSSelectorFromString(@"init"));
+        } @catch (NSException *e) {
+            effect = nil;
+        }
+        if (!effect) return;
+
+        @try {
+            // UIGlassEffect 是 UIVisualEffect 的子类
+            UIVisualEffectView *v =
+                [[UIVisualEffectView alloc] initWithEffect:(UIVisualEffect *)effect];
+            v.tag = WXAR_GLASS_TAG;
+            v.userInteractionEnabled = NO;      // 别挡住点击
+            v.autoresizingMask = UIViewAutoresizingFlexibleWidth |
+                                 UIViewAutoresizingFlexibleHeight;
+            [bar insertSubview:v atIndex:0];    // 垫到最底层
+            glass = v;
+            WXARLog(@"✅ 底部栏已装上液态玻璃");
+        } @catch (NSException *e) {
+            WXARLog(@"装液态玻璃失败：%@", e.reason);
+            return;
+        }
+    }
+
+    glass.frame = bar.bounds;
+
+    @try {
+        // 微信自己的背景不透明会把玻璃盖住，调成透明
+        id bg = [bar valueForKey:@"backgroundContentView"];
+        if ([bg isKindOfClass:[UIView class]]) {
+            UIView *bgView = (UIView *)bg;
+            if (bgView.backgroundColor &&
+                ![bgView.backgroundColor isEqual:[UIColor clearColor]]) {
+                bgView.backgroundColor = [UIColor clearColor];
+            }
+        }
+    } @catch (NSException *e) {
+        // KVC 取不到就算了，不影响主流程
+    }
+
+    if (bar.backgroundColor && ![bar.backgroundColor isEqual:[UIColor clearColor]]) {
+        bar.backgroundColor = [UIColor clearColor];
+    }
+}
+
+/// 共用桩：先跑微信原本的布局/初始化，再补上玻璃
+static void wxar_tabbar_forward0(id self, SEL _cmd) {
+    IMP orig = WXAROriginalForClass(object_getClass(self), _cmd);
+    if (orig) {
+        ((void (*)(id, SEL))orig)(self, _cmd);
+    }
+    @try {
+        WXARApplyGlassToView((UIView *)self);
+    } @catch (NSException *e) {
+        // 任何异常都不能影响微信本身
+    }
+}
+
+static int WXARInstallTabBarGlass(void) {
+    if (!NSClassFromString(@"UIGlassEffect")) {
+        WXARLog(@"系统没有 UIGlassEffect（低于 iOS 26），跳过液态玻璃");
+        return 0;
+    }
+    int n = 0;
+    // WCTabBarView 是新版微信的底部栏；两个时机都装上，谁先到算谁
+    if (WXARInstallForwarder("WCTabBarView", "setupSubviews", (IMP)wxar_tabbar_forward0)) n++;
+    if (WXARInstallForwarder("WCTabBarView", "layoutSubviews", (IMP)wxar_tabbar_forward0)) n++;
+    // 兼容旧结构
+    if (WXARInstallForwarder("MMTabBar", "layoutSubviews", (IMP)wxar_tabbar_forward0)) n++;
+    WXARLog(@"底部栏液态玻璃：装了 %d 个钩子", n);
+    return n;
+}
+
+// ===========================================================================
 #pragma mark - 候选表
 
 //
@@ -1150,6 +1301,9 @@ static void WXAREntry(void) {
 
         // 尽早装「捕获 CMessageMgr」的钩子：必须在它被创建/使用之前装上
         WXARInstallMgrCatcher();
+
+        // 底部栏液态玻璃（iOS 26+ 才生效，低版本自动跳过）
+        WXARInstallTabBarGlass();
 
         WXARLog(@"======== 微信防撤回 v%s 已加载 ========", WXAR_VERSION);
         WXARLog(@"设备 %@ / iOS %@",
