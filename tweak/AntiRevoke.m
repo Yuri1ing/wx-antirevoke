@@ -1032,6 +1032,25 @@ static BOOL WXARInstallForwarder(const char *clsName, const char *selName, IMP n
 
 #define WXAR_GLASS_TAG   0x7A115300
 
+// 液态玻璃专用诊断弹窗。只报这一个功能的状态，和别的诊断开关相互独立。
+// 定位完把这里改成 0 即可。
+#define WXAR_GLASS_DIAGNOSTIC  1
+
+static BOOL gGlassReported = NO;
+
+static void WXARGlassReport(NSString *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    va_end(ap);
+    WXARLog(@"[玻璃] %@", msg);
+#if WXAR_GLASS_DIAGNOSTIC
+    if (gGlassReported) return;
+    gGlassReported = YES;
+    WXARPopupForce(@"🪟 液态玻璃诊断", msg);
+#endif
+}
+
 /// 把玻璃垫到某个栏的底层；幂等，重复调用只更新尺寸。
 static void WXARApplyGlassToView(UIView *bar) {
     if (!bar) return;
@@ -1047,7 +1066,13 @@ static void WXARApplyGlassToView(UIView *bar) {
 
     if (!glass) {
         Class glassCls = NSClassFromString(@"UIGlassEffect");
-        if (!glassCls) return;                 // 系统低于 iOS 26，安静跳过
+        if (!glassCls) {
+            WXARGlassReport(@"❌ 系统里没有 UIGlassEffect 这个类\n\n"
+                            @"说明系统低于 iOS 26，液态玻璃用不了。\n"
+                            @"当前系统：%@",
+                            [[UIDevice currentDevice] systemVersion]);
+            return;
+        }
 
         id effect = nil;
         @try {
@@ -1056,7 +1081,10 @@ static void WXARApplyGlassToView(UIView *bar) {
         } @catch (NSException *e) {
             effect = nil;
         }
-        if (!effect) return;
+        if (!effect) {
+            WXARGlassReport(@"❌ UIGlassEffect 创建失败：alloc/init 返回了 nil");
+            return;
+        }
 
         @try {
             // UIGlassEffect 是 UIVisualEffect 的子类
@@ -1068,9 +1096,17 @@ static void WXARApplyGlassToView(UIView *bar) {
                                  UIViewAutoresizingFlexibleHeight;
             [bar insertSubview:v atIndex:0];    // 垫到最底层
             glass = v;
-            WXARLog(@"✅ 底部栏已装上液态玻璃");
+            WXARGlassReport(@"✅ 液态玻璃已装上\n\n"
+                            @"挂载视图：%@\n"
+                            @"尺寸：%.0f × %.0f\n"
+                            @"系统：iOS %@\n\n"
+                            @"如果底栏看起来还是原样，说明微信还有别的"
+                            @"不透明层盖在玻璃上，把这个框发我。",
+                            NSStringFromClass([bar class]),
+                            bar.bounds.size.width, bar.bounds.size.height,
+                            [[UIDevice currentDevice] systemVersion]);
         } @catch (NSException *e) {
-            WXARLog(@"装液态玻璃失败：%@", e.reason);
+            WXARGlassReport(@"❌ 创建 UIVisualEffectView 时抛异常：%@", e.reason);
             return;
         }
     }
@@ -1111,7 +1147,8 @@ static void wxar_tabbar_forward0(id self, SEL _cmd) {
 
 static int WXARInstallTabBarGlass(void) {
     if (!NSClassFromString(@"UIGlassEffect")) {
-        WXARLog(@"系统没有 UIGlassEffect（低于 iOS 26），跳过液态玻璃");
+        WXARGlassReport(@"❌ 系统没有 UIGlassEffect（低于 iOS 26）\n\n当前系统：%@",
+                        [[UIDevice currentDevice] systemVersion]);
         return 0;
     }
     int n = 0;
@@ -1121,6 +1158,15 @@ static int WXARInstallTabBarGlass(void) {
     // 兼容旧结构
     if (WXARInstallForwarder("MMTabBar", "layoutSubviews", (IMP)wxar_tabbar_forward0)) n++;
     WXARLog(@"底部栏液态玻璃：装了 %d 个钩子", n);
+
+    if (n == 0) {
+        WXARGlassReport(@"❌ 一个钩子都没装上\n\n"
+                        @"WCTabBarView 类：%@\n"
+                        @"MMTabBar 类：%@\n\n"
+                        @"说明底部栏的类名和预期不符。",
+                        objc_getClass("WCTabBarView") ? @"存在" : @"不存在",
+                        objc_getClass("MMTabBar") ? @"存在" : @"不存在");
+    }
     return n;
 }
 
@@ -1304,6 +1350,22 @@ static void WXAREntry(void) {
 
         // 底部栏液态玻璃（iOS 26+ 才生效，低版本自动跳过）
         WXARInstallTabBarGlass();
+
+        // 玻璃诊断：20 秒后若一次都没触发，说明钩子没被调用
+        dispatch_after(
+            dispatch_time(DISPATCH_TIME_NOW, (int64_t)(20.0 * NSEC_PER_SEC)),
+            dispatch_get_main_queue(), ^{
+                @autoreleasepool {
+                    if (!gGlassReported) {
+                        WXARGlassReport(@"⚠️ 钩子装上了，但一直没被调用\n\n"
+                                        @"20 秒内 WCTabBarView 的 setupSubviews / "
+                                        @"layoutSubviews 都没触发。\n\n"
+                                        @"可能原因：\n"
+                                        @"1. 底部栏不是 WCTabBarView\n"
+                                        @"2. 你还没切到主界面（微信/通讯录/发现/我）");
+                    }
+                }
+            });
 
         WXARLog(@"======== 微信防撤回 v%s 已加载 ========", WXAR_VERSION);
         WXARLog(@"设备 %@ / iOS %@",
