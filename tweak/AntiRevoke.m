@@ -1037,6 +1037,27 @@ static BOOL WXARInstallForwarder(const char *clsName, const char *selName, IMP n
 #define WXAR_GLASS_DIAGNOSTIC  1
 
 static BOOL gGlassReported = NO;
+static NSMutableSet<NSString *> *gGlassTouched = nil;   // 哪些类的钩子被触发过
+
+/// 把视图层级描述成文字，用来判断是谁挡住了玻璃
+static NSString *WXARDescribeSubviews(UIView *v) {
+    NSMutableString *s = [NSMutableString string];
+    NSArray<UIView *> *subs = v.subviews;
+    [s appendFormat:@"子视图 %lu 个：\n", (unsigned long)subs.count];
+    NSUInteger n = subs.count > 10 ? 10 : subs.count;
+    for (NSUInteger i = 0; i < n; i++) {
+        UIView *sub = subs[i];
+        UIColor *bg = sub.backgroundColor;
+        CGFloat alpha = bg ? CGColorGetAlpha(bg.CGColor) : 0.0;
+        NSString *bgDesc = (alpha < 0.01)
+            ? @"透明"
+            : [NSString stringWithFormat:@"不透明α%.2f", alpha];
+        [s appendFormat:@"%lu.%@ %@ %.0f×%.0f\n",
+            (unsigned long)i, NSStringFromClass([sub class]), bgDesc,
+            sub.frame.size.width, sub.frame.size.height];
+    }
+    return s;
+}
 
 static void WXARGlassReport(NSString *fmt, ...) {
     va_list ap;
@@ -1048,6 +1069,26 @@ static void WXARGlassReport(NSString *fmt, ...) {
     if (gGlassReported) return;
     gGlassReported = YES;
     WXARPopupForce(@"🪟 液态玻璃诊断", msg);
+#endif
+}
+
+/// 延迟 3 秒再汇总弹窗，这样能顺带收集「哪些类的钩子被触发过」
+static void WXARScheduleGlassReport(NSString *detail) {
+#if WXAR_GLASS_DIAGNOSTIC
+    static BOOL scheduled = NO;
+    if (scheduled) return;
+    scheduled = YES;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        NSMutableString *m = [NSMutableString stringWithString:detail];
+        [m appendFormat:@"\n触发过的类：%@",
+            gGlassTouched.count
+                ? [[gGlassTouched allObjects] componentsJoinedByString:@", "]
+                : @"(无)"];
+        WXARGlassReport(@"%@", m);
+    });
+#else
+    (void)detail;
 #endif
 }
 
@@ -1096,15 +1137,6 @@ static void WXARApplyGlassToView(UIView *bar) {
                                  UIViewAutoresizingFlexibleHeight;
             [bar insertSubview:v atIndex:0];    // 垫到最底层
             glass = v;
-            WXARGlassReport(@"✅ 液态玻璃已装上\n\n"
-                            @"挂载视图：%@\n"
-                            @"尺寸：%.0f × %.0f\n"
-                            @"系统：iOS %@\n\n"
-                            @"如果底栏看起来还是原样，说明微信还有别的"
-                            @"不透明层盖在玻璃上，把这个框发我。",
-                            NSStringFromClass([bar class]),
-                            bar.bounds.size.width, bar.bounds.size.height,
-                            [[UIDevice currentDevice] systemVersion]);
         } @catch (NSException *e) {
             WXARGlassReport(@"❌ 创建 UIVisualEffectView 时抛异常：%@", e.reason);
             return;
@@ -1113,8 +1145,8 @@ static void WXARApplyGlassToView(UIView *bar) {
 
     glass.frame = bar.bounds;
 
+    // 1) 微信自带的背景视图（WCTabBarView 有 backgroundContentView 属性）
     @try {
-        // 微信自己的背景不透明会把玻璃盖住，调成透明
         id bg = [bar valueForKey:@"backgroundContentView"];
         if ([bg isKindOfClass:[UIView class]]) {
             UIView *bgView = (UIView *)bg;
@@ -1127,13 +1159,44 @@ static void WXARApplyGlassToView(UIView *bar) {
         // KVC 取不到就算了，不影响主流程
     }
 
+    // 2) 栏自身背景
     if (bar.backgroundColor && ![bar.backgroundColor isEqual:[UIColor clearColor]]) {
         bar.backgroundColor = [UIColor clearColor];
+    }
+
+    // 3) 逐个子视图：任何不透明的纯背景层都会把玻璃挡住，一律调透明。
+    //    这里只动 backgroundColor —— 图标是 UIImageView（背景本来就是 nil），
+    //    微信自绘的 UIVisualEffectView 通常也没有 backgroundColor，都不会被误伤。
+    for (UIView *sub in bar.subviews) {
+        if (sub == glass) continue;
+        @try {
+            UIColor *bg = sub.backgroundColor;
+            if (bg && CGColorGetAlpha(bg.CGColor) > 0.01) {
+                sub.backgroundColor = [UIColor clearColor];
+            }
+        } @catch (NSException *e) { }
+    }
+
+    // 装好了才报告，并把子视图层级一起带上
+    if (glass && !gGlassReported) {
+        NSMutableString *detail = [NSMutableString string];
+        [detail appendFormat:@"✅ 液态玻璃已装上\n\n"
+                             @"挂载视图：%@\n尺寸：%.0f × %.0f\n系统：iOS %@\n\n%@",
+                             NSStringFromClass([bar class]),
+                             bar.bounds.size.width, bar.bounds.size.height,
+                             [[UIDevice currentDevice] systemVersion],
+                             WXARDescribeSubviews(bar)];
+        WXARScheduleGlassReport(detail);
     }
 }
 
 /// 共用桩：先跑微信原本的布局/初始化，再补上玻璃
 static void wxar_tabbar_forward0(id self, SEL _cmd) {
+    if (!gGlassTouched) gGlassTouched = [NSMutableSet set];
+    @try {
+        [gGlassTouched addObject:NSStringFromClass(object_getClass(self))];
+    } @catch (NSException *e) { }
+
     IMP orig = WXAROriginalForClass(object_getClass(self), _cmd);
     if (orig) {
         ((void (*)(id, SEL))orig)(self, _cmd);
