@@ -1039,6 +1039,20 @@ static BOOL WXARInstallForwarder(const char *clsName, const char *selName, IMP n
 static BOOL gGlassReported = NO;
 static NSMutableSet<NSString *> *gGlassTouched = nil;   // 哪些类的钩子被触发过
 
+/// 打印一个对象的继承链，用来确认它到底是什么类
+static NSString *WXARClassChain(id obj) {
+    NSMutableString *s = [NSMutableString string];
+    Class c = object_getClass(obj);
+    int depth = 0;
+    while (c && depth < 8) {
+        [s appendFormat:@"%@ < ", NSStringFromClass(c)];
+        c = class_getSuperclass(c);
+        depth++;
+    }
+    [s appendString:@"(root)"];
+    return s;
+}
+
 /// 把视图层级描述成文字，用来判断是谁挡住了玻璃
 static NSString *WXARDescribeSubviews(UIView *v) {
     NSMutableString *s = [NSMutableString string];
@@ -1126,6 +1140,20 @@ static void WXARApplyGlassToView(UIView *bar) {
             WXARGlassReport(@"❌ UIGlassEffect 创建失败：alloc/init 返回了 nil");
             return;
         }
+
+        // 【诊断用】给玻璃加一层明显的蓝色 tint。
+        // 目的：把「玻璃压根没生效」和「玻璃生效了、只是后面没内容可透」区分开。
+        // 底栏明显偏蓝 = 玻璃在显示；一点不蓝 = 真被挡住了。
+        // 确认完把这段删掉即可。
+        @try {
+            SEL tintSel = NSSelectorFromString(@"setTintColor:");
+            if ([effect respondsToSelector:tintSel]) {
+                ((void (*)(id, SEL, id))objc_msgSend)(
+                    effect, tintSel,
+                    [UIColor colorWithRed:0.0 green:0.55 blue:1.0 alpha:0.55]);
+                WXARLog(@"[玻璃] 已给 effect 加上诊断用蓝色 tint");
+            }
+        } @catch (NSException *e) { }
 
         @try {
             // UIGlassEffect 是 UIVisualEffect 的子类
@@ -1235,10 +1263,12 @@ static void WXARApplyGlassToView(UIView *bar) {
     if (glass && !gGlassReported) {
         NSMutableString *detail = [NSMutableString string];
         [detail appendFormat:@"✅ 液态玻璃已装上\n\n"
-                             @"挂载视图：%@\n尺寸：%.0f × %.0f\n系统：iOS %@\n\n%@",
+                             @"挂载视图：%@\n尺寸：%.0f × %.0f\n系统：iOS %@\n\n"
+                             @"继承链：\n%@\n\n%@",
                              NSStringFromClass([bar class]),
                              bar.bounds.size.width, bar.bounds.size.height,
                              [[UIDevice currentDevice] systemVersion],
+                             WXARClassChain(bar),
                              WXARDescribeSubviews(bar)];
         WXARScheduleGlassReport(detail);
     }
