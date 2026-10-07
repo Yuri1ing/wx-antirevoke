@@ -1191,6 +1191,46 @@ static void WXARApplyGlassToView(UIView *bar) {
     //    每次都重新插回底层，保证它一直在最下面。
     [bar insertSubview:glass atIndex:0];
 
+    // 5) 关键一步：MMTabBar 其实是 UITabBar 的子类（子视图里有 _UIBarBackground
+    //    和 UITabBarButton 这些私有类名可以佐证）。UITabBar 的背景由
+    //    UITabBarAppearance 统一绘制 —— 在视图层面改 backgroundColor 会被它
+    //    在下一个布局周期覆盖回去，必须把外观对象本身设成透明。
+    @try {
+        if ([bar respondsToSelector:NSSelectorFromString(@"setStandardAppearance:")]) {
+            Class apCls = NSClassFromString(@"UITabBarAppearance");
+            if (apCls) {
+                id ap = ((id (*)(id, SEL))objc_msgSend)([apCls alloc],
+                                                        NSSelectorFromString(@"init"));
+                if (ap) {
+                    SEL cfgSel = NSSelectorFromString(@"configureWithTransparentBackground");
+                    if ([ap respondsToSelector:cfgSel]) {
+                        ((void (*)(id, SEL))objc_msgSend)(ap, cfgSel);
+                    }
+                    SEL setStd = NSSelectorFromString(@"setStandardAppearance:");
+                    SEL setEdge = NSSelectorFromString(@"setScrollEdgeAppearance:");
+                    if ([bar respondsToSelector:setStd]) {
+                        ((void (*)(id, SEL, id))objc_msgSend)(bar, setStd, ap);
+                    }
+                    if ([bar respondsToSelector:setEdge]) {
+                        ((void (*)(id, SEL, id))objc_msgSend)(bar, setEdge, ap);
+                    }
+                    WXARLog(@"[玻璃] 已把 UITabBarAppearance 设为透明背景");
+                }
+            }
+        }
+    } @catch (NSException *e) {
+        WXARLog(@"[玻璃] 设置 appearance 失败：%@", e.reason);
+    }
+
+    // 6) 兜底：UITabBar 内部专门画背景的那个视图，直接藏掉
+    for (UIView *sub in bar.subviews) {
+        @try {
+            if ([NSStringFromClass([sub class]) isEqualToString:@"_UIBarBackground"]) {
+                sub.hidden = YES;
+            }
+        } @catch (NSException *e) { }
+    }
+
     // 装好了才报告，并把子视图层级一起带上
     if (glass && !gGlassReported) {
         NSMutableString *detail = [NSMutableString string];
