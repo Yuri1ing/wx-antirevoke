@@ -1069,8 +1069,50 @@ static NSString *WXARDescribeSubviews(UIView *v) {
         [s appendFormat:@"%lu.%@ %@ %.0f×%.0f\n",
             (unsigned long)i, NSStringFromClass([sub class]), bgDesc,
             sub.frame.size.width, sub.frame.size.height];
+        // UIVisualEffectView 额外报一下它挂的 effect 是什么。
+        // 微信自己的底栏背景就是这种视图，它的 effect 能直接告诉我们
+        // iOS 26 上「正确用法」长什么样 —— 比我猜要可靠得多。
+        if ([sub isKindOfClass:[UIVisualEffectView class]]) {
+            id eff = [(UIVisualEffectView *)sub effect];
+            [s appendFormat:@"     └ effect: %@  hidden: %@  alpha: %.2f\n",
+                eff ? NSStringFromClass([eff class]) : @"(nil)",
+                sub.hidden ? @"是" : @"否", sub.alpha];
+        }
     }
     return s;
+}
+
+/// 列出运行时所有类名里含 "Glass" 的类。
+/// 液态玻璃是 iOS 26 新东西，公开资料里查不到完整 API 清单，
+/// 与其猜，不如直接问系统：到底有哪些相关的类。
+static NSString *WXARListGlassClasses(void) {
+    NSMutableString *result = [NSMutableString string];
+    @try {
+        int count = objc_getClassList(NULL, 0);
+        if (count <= 0) return @"(拿不到类列表)";
+        Class *classes = (Class *)malloc(sizeof(Class) * (size_t)count);
+        if (!classes) return @"(内存分配失败)";
+        count = objc_getClassList(classes, count);
+        NSMutableArray<NSString *> *hits = [NSMutableArray array];
+        for (int i = 0; i < count; i++) {
+            const char *name = class_getName(classes[i]);
+            if (name && strstr(name, "Glass")) {
+                [hits addObject:[NSString stringWithUTF8String:name]];
+            }
+        }
+        free(classes);
+        [hits sortUsingSelector:@selector(compare:)];
+        if (hits.count == 0) {
+            [result appendString:@"  (一个都没有)"];
+        } else {
+            for (NSString *n in hits) {
+                [result appendFormat:@"  %@\n", n];
+            }
+        }
+    } @catch (NSException *e) {
+        [result appendFormat:@"  (异常：%@)", e.reason];
+    }
+    return result;
 }
 
 static void WXARGlassReport(NSString *fmt, ...) {
@@ -1282,6 +1324,18 @@ static void WXARApplyGlassToView(UIView *bar) {
                              [[UIDevice currentDevice] systemVersion],
                              WXARClassChain(bar),
                              WXARDescribeSubviews(bar)];
+        // 核心诊断：我们建的玻璃视图究竟认没认下那个 effect。
+        // 如果 UIGlassEffect 不是 UIVisualEffect 的子类，initWithEffect: 会
+        // 把它当无效值丢掉，这里就会显示 (nil)。
+        [detail appendFormat:@"\n玻璃视图 effect：%@\n"
+                             @"effect 继承链：%@\n"
+                             @"玻璃 hidden：%@  alpha：%.2f\n\n"
+                             @"系统里带 Glass 的类：\n%@",
+                             glass.effect
+                                 ? NSStringFromClass([glass.effect class]) : @"(nil)",
+                             glass.effect ? WXARClassChain(glass.effect) : @"-",
+                             glass.hidden ? @"是" : @"否", glass.alpha,
+                             WXARListGlassClasses()];
         WXARScheduleGlassReport(detail);
     }
 }
