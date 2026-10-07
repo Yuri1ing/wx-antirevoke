@@ -1141,25 +1141,24 @@ static void WXARApplyGlassToView(UIView *bar) {
             return;
         }
 
-        // 【诊断用】给玻璃加一层明显的蓝色 tint。
-        // 目的：把「玻璃压根没生效」和「玻璃生效了、只是后面没内容可透」区分开。
-        // 底栏明显偏蓝 = 玻璃在显示；一点不蓝 = 真被挡住了。
-        // 确认完把这段删掉即可。
-        @try {
-            SEL tintSel = NSSelectorFromString(@"setTintColor:");
-            if ([effect respondsToSelector:tintSel]) {
-                ((void (*)(id, SEL, id))objc_msgSend)(
-                    effect, tintSel,
-                    [UIColor colorWithRed:0.0 green:0.55 blue:1.0 alpha:0.55]);
-                WXARLog(@"[玻璃] 已给 effect 加上诊断用蓝色 tint");
-            }
-        } @catch (NSException *e) { }
+        // 【诊断结论】上一版给 effect 加的蓝色 tint 在真机上一点没显出来，
+        // 说明问题不在于「玻璃很淡」——浓到 55% 的蓝都看不见，只能是这一层
+        // 根本没显示出来。所以这次换一个更硬的判据：直接给玻璃的 contentView
+        // 铺红色背景。contentView 位于 effect 之上，不经过模糊采样，
+        // 只要这个视图真的显示在屏幕上，底栏就必然偏红。
 
         @try {
             // UIGlassEffect 是 UIVisualEffect 的子类
             UIVisualEffectView *v =
                 [[UIVisualEffectView alloc] initWithEffect:(UIVisualEffect *)effect];
             v.tag = WXAR_GLASS_TAG;
+            // 【诊断用】红色标记，确认后删掉这一行即可。
+            // 底栏偏红 = 玻璃视图确实显示在屏幕上了，问题出在 effect/遮挡；
+            // 一点不红 = 玻璃视图本身被别的东西盖住了。
+            @try {
+                v.contentView.backgroundColor =
+                    [UIColor colorWithRed:1.0 green:0.0 blue:0.0 alpha:0.45];
+            } @catch (NSException *e) { }
             v.userInteractionEnabled = NO;      // 别挡住点击
             v.autoresizingMask = UIViewAutoresizingFlexibleWidth |
                                  UIViewAutoresizingFlexibleHeight;
@@ -1223,41 +1222,54 @@ static void WXARApplyGlassToView(UIView *bar) {
     //    和 UITabBarButton 这些私有类名可以佐证）。UITabBar 的背景由
     //    UITabBarAppearance 统一绘制 —— 在视图层面改 backgroundColor 会被它
     //    在下一个布局周期覆盖回去，必须把外观对象本身设成透明。
+    //
+    //    上一版这里踩了坑：直接 alloc 一个全新的 UITabBarAppearance 盖上去，
+    //    等于把微信自己设过的整套外观参数（item 宽度、文字偏移等）清成默认值。
+    //    结果系统那 4 个 UITabBarButton 摆到了错误位置，和微信自绘的
+    //    MMTabBarItemView 错开显示 —— 底栏就出现了上下两排文字。
+    //
+    //    正确做法：取微信现有的 appearance，copy 一份再改背景，只动背景这一个属性。
     @try {
-        if ([bar respondsToSelector:NSSelectorFromString(@"setStandardAppearance:")]) {
-            Class apCls = NSClassFromString(@"UITabBarAppearance");
-            if (apCls) {
-                id ap = ((id (*)(id, SEL))objc_msgSend)([apCls alloc],
-                                                        NSSelectorFromString(@"init"));
-                if (ap) {
-                    SEL cfgSel = NSSelectorFromString(@"configureWithTransparentBackground");
-                    if ([ap respondsToSelector:cfgSel]) {
-                        ((void (*)(id, SEL))objc_msgSend)(ap, cfgSel);
-                    }
-                    SEL setStd = NSSelectorFromString(@"setStandardAppearance:");
-                    SEL setEdge = NSSelectorFromString(@"setScrollEdgeAppearance:");
-                    if ([bar respondsToSelector:setStd]) {
-                        ((void (*)(id, SEL, id))objc_msgSend)(bar, setStd, ap);
-                    }
-                    if ([bar respondsToSelector:setEdge]) {
-                        ((void (*)(id, SEL, id))objc_msgSend)(bar, setEdge, ap);
-                    }
-                    WXARLog(@"[玻璃] 已把 UITabBarAppearance 设为透明背景");
+        SEL getStd = NSSelectorFromString(@"standardAppearance");
+        SEL setStd = NSSelectorFromString(@"setStandardAppearance:");
+        SEL setEdge = NSSelectorFromString(@"setScrollEdgeAppearance:");
+        if ([bar respondsToSelector:getStd] && [bar respondsToSelector:setStd]) {
+            id ap = ((id (*)(id, SEL))objc_msgSend)(bar, getStd);
+            if (!ap) {
+                Class apCls = NSClassFromString(@"UITabBarAppearance");
+                if (apCls) {
+                    ap = ((id (*)(id, SEL))objc_msgSend)([apCls alloc],
+                                                         NSSelectorFromString(@"init"));
                 }
+            }
+            if (ap) {
+                // 关键：复制而非新建，微信原有的外观参数原样保留
+                SEL copySel = NSSelectorFromString(@"copy");
+                if ([ap respondsToSelector:copySel]) {
+                    id copied = ((id (*)(id, SEL))objc_msgSend)(ap, copySel);
+                    if (copied) ap = copied;
+                }
+                SEL cfgSel = NSSelectorFromString(@"configureWithTransparentBackground");
+                if ([ap respondsToSelector:cfgSel]) {
+                    ((void (*)(id, SEL))objc_msgSend)(ap, cfgSel);
+                }
+                ((void (*)(id, SEL, id))objc_msgSend)(bar, setStd, ap);
+                if ([bar respondsToSelector:setEdge]) {
+                    ((void (*)(id, SEL, id))objc_msgSend)(bar, setEdge, ap);
+                }
+                WXARLog(@"[玻璃] 已在微信原有 appearance 基础上设为透明背景");
             }
         }
     } @catch (NSException *e) {
         WXARLog(@"[玻璃] 设置 appearance 失败：%@", e.reason);
     }
 
-    // 6) 兜底：UITabBar 内部专门画背景的那个视图，直接藏掉
-    for (UIView *sub in bar.subviews) {
-        @try {
-            if ([NSStringFromClass([sub class]) isEqualToString:@"_UIBarBackground"]) {
-                sub.hidden = YES;
-            }
-        } @catch (NSException *e) { }
-    }
+    // 6) 不再手动隐藏 _UIBarBackground。
+    //    上一步已经把 appearance 背景设透明，系统自己就会让这个视图变透明；
+    //    手动 hidden 属于多余的干预，可能干扰系统内部的布局逻辑。
+    //
+    //    另外它也只是「背景」层，并不能解释底栏为什么还是不透 —— 要继续查的话
+    //    得看 MMTabBar 的父视图链上谁还是不透明的。
 
     // 装好了才报告，并把子视图层级一起带上
     if (glass && !gGlassReported) {
