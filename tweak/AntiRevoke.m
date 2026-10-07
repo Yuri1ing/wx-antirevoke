@@ -1032,6 +1032,24 @@ static BOOL WXARInstallForwarder(const char *clsName, const char *selName, IMP n
 
 #define WXAR_GLASS_TAG   0x7A115300
 
+// --- 液态玻璃总开关 -------------------------------------------------------
+//
+// 0 = 关闭：不装任何底栏 hook，微信底栏 100% 保持原样，插件只做防撤回。
+// 1 = 启用底栏液态玻璃。
+//
+// 关闭原因（两条路都真机试过，记在这里备查）：
+//
+//   宿主 IPA 声明了 UIDesignRequiresCompatibility = true，这是 App 级开关，
+//   系统读到它就在整个进程内禁用液态玻璃 —— UIGlassEffect 一律渲染成全透明。
+//   想拿到真玻璃必须把这个 key 从 IPA 里删掉，但代价是整个 App 切成 iOS 26
+//   新设计：微信自绘的 MMTabBarItemView 仍按旧尺寸摆放，与系统新布局错位，
+//   底栏出现两套图标。反过来保留这个 key 就只能用 UIBlurEffect 兜底，而它
+//   模糊的是「背后的内容」—— 微信底栏背后是纯黑，模糊纯黑还是纯黑，
+//   后面补半透明填充也救不回观感。
+//
+//   结论：真玻璃要牺牲整个 App 的外观，兜底又出不来效果。保持微信原样。
+#define WXAR_ENABLE_GLASS  0
+
 // 液态玻璃专用诊断弹窗。只报这一个功能的状态，和别的诊断开关相互独立。
 // 定位完把这里改成 0 即可。
 #define WXAR_GLASS_DIAGNOSTIC  0
@@ -1443,6 +1461,13 @@ static void wxar_tabbar_forward0(id self, SEL _cmd) {
 }
 
 static int WXARInstallTabBarGlass(void) {
+    // 总开关关着就直接退出：一个 hook 都不装，微信底栏完全按它自己的来。
+    // 放在最前面是为了保证连 WCTabBarView/MMTabBar 的转发桩都不存在 ——
+    // 底栏是每个界面都在跑的布局方法，能不碰就不碰。
+    if (!WXAR_ENABLE_GLASS) {
+        WXARLog(@"液态玻璃已关闭（WXAR_ENABLE_GLASS=0），底栏保持微信原样");
+        return 0;
+    }
     if (!NSClassFromString(@"UIGlassEffect")) {
         WXARGlassReport(@"❌ 系统没有 UIGlassEffect（低于 iOS 26）\n\n当前系统：%@",
                         [[UIDevice currentDevice] systemVersion]);
