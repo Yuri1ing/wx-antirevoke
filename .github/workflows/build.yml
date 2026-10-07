@@ -5,6 +5,9 @@ on:
     branches: ["**"]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: macos-latest
@@ -35,3 +38,28 @@ jobs:
             build/wxantirevoke.dylib
           if-no-files-found: error
           retention-days: 30
+
+      - name: 算产物校验值
+        id: sum
+        run: |
+          shasum -a 256 build/wxantirevoke.dylib
+          echo "sha=$(shasum -a 256 build/wxantirevoke.dylib | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          ls -l build/wxantirevoke.dylib
+
+      - name: 发布到 Release（公开仓库可匿名下载）
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ steps.sum.outputs.sha }}
+          RUN: ${{ github.run_number }}
+          COMMIT: ${{ github.sha }}
+        run: |
+          cat > /tmp/notes.md <<EOF
+          自动构建产物，对应提交 \`$COMMIT\`。
+
+          - dylib SHA256: \`$SHA\`
+          - 目标: 微信 8.0.79 + 底栏液态玻璃
+          EOF
+          gh release create "build-$RUN" build/wxantirevoke.dylib \
+            --title "构建 #$RUN" \
+            --notes-file /tmp/notes.md \
+            --target "$COMMIT"
