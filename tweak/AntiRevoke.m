@@ -1275,6 +1275,18 @@ static void WXARApplyGlassToView(UIView *bar) {
     for (UIView *sub in bar.subviews) {
         if (sub == glass) continue;
         @try {
+            NSString *clsName = NSStringFromClass([sub class]);
+            // iOS 26 新设计下，系统的 UITabBar 会额外画一块悬浮胶囊形的底板：
+            // UIKit._UITabBarPlatterView，比底栏本身内缩（实测 351×69 vs 393×90）。
+            //
+            // 微信是自己画图标的，根本不往系统 tabBar 里放 item，所以这个 platter
+            // 是个什么都没有的空盘子 —— 它和微信自绘的 MMTabBarItemView 错开显示，
+            // 于是就成了「两个底栏 + 图标错位 + 玻璃层没图标」。
+            // 直接藏掉，只留我们的玻璃和微信自己的图标。
+            if ([clsName containsString:@"Platter"]) {
+                sub.hidden = YES;
+                continue;
+            }
             if ([sub isKindOfClass:[UIVisualEffectView class]]) {
                 UIVisualEffectView *ve = (UIVisualEffectView *)sub;
                 ve.effect = nil;
