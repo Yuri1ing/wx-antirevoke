@@ -1115,6 +1115,23 @@ static NSString *WXARListGlassClasses(void) {
     return result;
 }
 
+/// App 是否声明了 iOS 26 的「旧设计兼容模式」。
+///
+/// 微信 8.0.79 的 Info.plist 里 UIDesignRequiresCompatibility = true
+/// （已从 IPA 里实读确认），而它又是用 iphoneos26.1 SDK 编译的。
+/// 这个组合会让系统在整个 App 内禁用液态玻璃 —— 所有 UIGlassEffect
+/// 都渲染成完全透明。这不是写错了 API，是宿主 App 主动关掉了这条路。
+static BOOL WXARAppUsesLegacyDesign(void) {
+    @try {
+        id v = [[NSBundle mainBundle]
+            objectForInfoDictionaryKey:@"UIDesignRequiresCompatibility"];
+        if (v && [v respondsToSelector:@selector(boolValue)]) {
+            return [v boolValue];
+        }
+    } @catch (NSException *e) { }
+    return NO;
+}
+
 static void WXARGlassReport(NSString *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
@@ -1172,15 +1189,38 @@ static void WXARApplyGlassToView(UIView *bar) {
         }
 
         id effect = nil;
-        @try {
-            effect = ((id (*)(id, SEL))objc_msgSend)([glassCls alloc],
-                                                     NSSelectorFromString(@"init"));
-        } @catch (NSException *e) {
-            effect = nil;
-        }
-        if (!effect) {
-            WXARGlassReport(@"❌ UIGlassEffect 创建失败：alloc/init 返回了 nil");
-            return;
+        BOOL legacyDesign = WXARAppUsesLegacyDesign();
+        if (legacyDesign) {
+            // 兼容模式下 UIGlassEffect 渲染出来是全透明的，等于没用。
+            // 退回仍然可用的老材质：systemUltraThinMaterial 在所有系统版本上
+            // 都能出半透明模糊，观感最接近液态玻璃 —— 这是兼容模式下
+            // 能拿到的最好结果（枚举值 6 = SystemUltraThinMaterial）。
+            @try {
+                Class blurCls = NSClassFromString(@"UIBlurEffect");
+                SEL mk = NSSelectorFromString(@"effectWithStyle:");
+                if (blurCls && [blurCls respondsToSelector:mk]) {
+                    effect = ((id (*)(id, SEL, NSInteger))objc_msgSend)(blurCls, mk, 6);
+                }
+            } @catch (NSException *e) {
+                effect = nil;
+            }
+            if (!effect) {
+                WXARGlassReport(@"❌ 兼容模式下 UIBlurEffect 也没能创建\n\n"
+                                @"系统：%@", [[UIDevice currentDevice] systemVersion]);
+                return;
+            }
+            WXARLog(@"[玻璃] 检测到旧设计兼容模式，改用 UIBlurEffect 材质");
+        } else {
+            @try {
+                effect = ((id (*)(id, SEL))objc_msgSend)([glassCls alloc],
+                                                         NSSelectorFromString(@"init"));
+            } @catch (NSException *e) {
+                effect = nil;
+            }
+            if (!effect) {
+                WXARGlassReport(@"❌ UIGlassEffect 创建失败：alloc/init 返回了 nil");
+                return;
+            }
         }
 
         // 【诊断结论】上一版给 effect 加的蓝色 tint 在真机上一点没显出来，
@@ -1194,13 +1234,6 @@ static void WXARApplyGlassToView(UIView *bar) {
             UIVisualEffectView *v =
                 [[UIVisualEffectView alloc] initWithEffect:(UIVisualEffect *)effect];
             v.tag = WXAR_GLASS_TAG;
-            // 【诊断用】红色标记，确认后删掉这一行即可。
-            // 底栏偏红 = 玻璃视图确实显示在屏幕上了，问题出在 effect/遮挡；
-            // 一点不红 = 玻璃视图本身被别的东西盖住了。
-            @try {
-                v.contentView.backgroundColor =
-                    [UIColor colorWithRed:1.0 green:0.0 blue:0.0 alpha:0.45];
-            } @catch (NSException *e) { }
             v.userInteractionEnabled = NO;      // 别挡住点击
             v.autoresizingMask = UIViewAutoresizingFlexibleWidth |
                                  UIViewAutoresizingFlexibleHeight;
@@ -1324,18 +1357,18 @@ static void WXARApplyGlassToView(UIView *bar) {
                              [[UIDevice currentDevice] systemVersion],
                              WXARClassChain(bar),
                              WXARDescribeSubviews(bar)];
-        // 核心诊断：我们建的玻璃视图究竟认没认下那个 effect。
-        // 如果 UIGlassEffect 不是 UIVisualEffect 的子类，initWithEffect: 会
-        // 把它当无效值丢掉，这里就会显示 (nil)。
-        [detail appendFormat:@"\n玻璃视图 effect：%@\n"
+        // 这一版要确认的只有一件事：走的是哪条分支。
+        // 上几版那些子视图/Glass 类清单已经查完，不再重复占屏幕。
+        [detail appendFormat:@"\nApp 旧设计兼容模式：%@\n"
+                             @"玻璃 effect：%@\n"
                              @"effect 继承链：%@\n"
-                             @"玻璃 hidden：%@  alpha：%.2f\n\n"
-                             @"系统里带 Glass 的类：\n%@",
+                             @"玻璃 hidden：%@  alpha：%.2f",
+                             WXARAppUsesLegacyDesign()
+                                 ? @"是（系统已禁用液态玻璃）" : @"否",
                              glass.effect
                                  ? NSStringFromClass([glass.effect class]) : @"(nil)",
                              glass.effect ? WXARClassChain(glass.effect) : @"-",
-                             glass.hidden ? @"是" : @"否", glass.alpha,
-                             WXARListGlassClasses()];
+                             glass.hidden ? @"是" : @"否", glass.alpha];
         WXARScheduleGlassReport(detail);
     }
 }
