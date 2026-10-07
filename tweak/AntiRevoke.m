@@ -1247,6 +1247,45 @@ static void WXARApplyGlassToView(UIView *bar) {
 
     glass.frame = bar.bounds;
 
+    // 【观感修饰】兼容模式下 UIGlassEffect 被系统禁用，退回 UIBlurEffect 兜底。
+    // 但 UIBlurEffect 模糊的是「它背后的内容」，而微信底栏背后就是纯黑 ——
+    // 模糊纯黑出来还是纯黑，于是真机反馈就成了「图标对齐了，但完全没有玻璃感」。
+    //
+    // iOS 26 真液态玻璃在背后没有内容可采样时，观感其实主要靠两处人工痕迹撑着：
+    //   ① 比背景亮一档的半透明填充
+    //   ② 顶部一条极细的高光边
+    // 真玻璃模式下这两样由系统绘制，兼容模式下没有，这里手工补上，
+    // 让底栏至少是一块「玻璃片」，而不是一块死黑。
+    //
+    // 只在兼容模式下加：真玻璃模式下系统自己会画，再加一遍就糊了。
+    if (WXARAppUsesLegacyDesign()) {
+        @try {
+            const NSInteger kFillTag = 0x7A115301;
+            BOOL already = NO;
+            for (UIView *cv in glass.contentView.subviews) {
+                if (cv.tag == kFillTag) { already = YES; break; }
+            }
+            if (!already) {
+                // ① 半透明填充：把底栏整体提亮一档，和纯黑列表背景拉开层次
+                UIView *fill = [[UIView alloc] initWithFrame:glass.bounds];
+                fill.tag = kFillTag;
+                fill.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.10];
+                fill.userInteractionEnabled = NO;
+                fill.autoresizingMask = UIViewAutoresizingFlexibleWidth |
+                                        UIViewAutoresizingFlexibleHeight;
+                [glass.contentView addSubview:fill];
+
+                // ② 顶部高光：0.5pt 的白色细线，模拟玻璃边缘的反光
+                UIView *hl = [[UIView alloc] initWithFrame:
+                                CGRectMake(0, 0, glass.bounds.size.width, 0.5)];
+                hl.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.35];
+                hl.userInteractionEnabled = NO;
+                hl.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+                [glass.contentView addSubview:hl];
+            }
+        } @catch (NSException *e) { }
+    }
+
     // 1) 微信自带的背景视图（WCTabBarView 有 backgroundContentView 属性）
     @try {
         id bg = [bar valueForKey:@"backgroundContentView"];
