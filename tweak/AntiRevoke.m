@@ -1034,7 +1034,7 @@ static BOOL WXARInstallForwarder(const char *clsName, const char *selName, IMP n
 
 // 液态玻璃专用诊断弹窗。只报这一个功能的状态，和别的诊断开关相互独立。
 // 定位完把这里改成 0 即可。
-#define WXAR_GLASS_DIAGNOSTIC  1
+#define WXAR_GLASS_DIAGNOSTIC  0
 
 static BOOL gGlassReported = NO;
 static NSMutableSet<NSString *> *gGlassTouched = nil;   // 哪些类的钩子被触发过
